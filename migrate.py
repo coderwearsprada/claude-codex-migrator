@@ -239,31 +239,20 @@ class Ctx:
     merge: bool
     backup: bool
     report: Report
+    plan_mode: bool = False
+    planned_writes: set[Path] = field(default_factory=set)
     backup_root: Path = field(init=False)
 
     def __post_init__(self) -> None:
         self.backup_root = self.dst_root / "backups" / f"pre-migrate-{ts()}"
 
 
-def _backup_if_exists(ctx: Ctx, path: Path) -> None:
-    if not path.exists() or not ctx.backup:
-        return
-    dest = ctx.backup_root / path.name
-    i = 1
-    while dest.exists():
-        dest = ctx.backup_root / f"{path.stem}.{i}{path.suffix}"
-        i += 1
-    if ctx.dry_run:
-        ctx.report.backups.append(f"would back up: {path} → {dest}")
-        return
-    ctx.backup_root.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(path, dest)
-    ctx.report.backups.append(str(dest))
-
-
 def write_text(ctx: Ctx, path: Path, content: str) -> None:
-    _backup_if_exists(ctx, path)
+    if ctx.plan_mode:
+        ctx.planned_writes.add(path)
+        return
     if ctx.dry_run:
+        ctx.planned_writes.add(path)
         print(f"[dry-run] write {path}")
         return
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -271,12 +260,64 @@ def write_text(ctx: Ctx, path: Path, content: str) -> None:
 
 
 def copy_file(ctx: Ctx, src: Path, dst: Path) -> None:
-    _backup_if_exists(ctx, dst)
+    if ctx.plan_mode:
+        ctx.planned_writes.add(dst)
+        return
     if ctx.dry_run:
+        ctx.planned_writes.add(dst)
         print(f"[dry-run] copy {src} → {dst}")
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src, dst)
+
+
+def perform_backup(ctx: Ctx) -> Path | None:
+    """Back up every planned destination + write a manifest. Returns backup dir."""
+    if not ctx.backup or not ctx.planned_writes:
+        return None
+
+    entries: list[dict] = []
+    for p in sorted(ctx.planned_writes):
+        try:
+            rel = p.relative_to(ctx.dst_root)
+        except ValueError:
+            rel = Path(p.name)
+        existed = p.exists()
+        entries.append({
+            "original": str(p),
+            "relative": str(rel),
+            "existed_before": existed,
+        })
+
+    if ctx.dry_run:
+        for e in entries:
+            if e["existed_before"]:
+                ctx.report.backups.append(
+                    f"would back up: {e['original']} → "
+                    f"{ctx.backup_root}/{e['relative']}"
+                )
+        return None
+
+    ctx.backup_root.mkdir(parents=True, exist_ok=True)
+    for e in entries:
+        if not e["existed_before"]:
+            continue
+        src = Path(e["original"])
+        dest = ctx.backup_root / e["relative"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest)
+        ctx.report.backups.append(str(dest))
+
+    manifest = {
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "direction": ctx.report.direction,
+        "src_root": str(ctx.src_root),
+        "dst_root": str(ctx.dst_root),
+        "entries": entries,
+    }
+    (ctx.backup_root / "manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return ctx.backup_root
 
 
 def load_json(p: Path) -> dict:
@@ -1056,6 +1097,96 @@ def run_codex_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
 # CLI
 # ============================================================================
 
+# ============================================================================
+# Restore
+# ============================================================================
+
+def find_latest_backup() -> Path | None:
+    bases = [
+        Path.home() / ".claude" / "backups",
+        Path.home() / ".codex" / "backups",
+        Path.cwd() / ".claude" / "backups",
+        Path.cwd() / ".codex" / "backups",
+    ]
+    candidates: list[Path] = []
+    for b in bases:
+        if b.is_dir():
+            for p in b.glob("pre-migrate-*"):
+                if (p / "manifest.json").exists():
+                    candidates.append(p)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def restore_from_backup(backup_path: Path, interactive: bool,
+                        dry_run: bool) -> int:
+    manifest_path = backup_path / "manifest.json"
+    if not manifest_path.exists():
+        print(f"No manifest.json at {backup_path}", file=sys.stderr)
+        return 1
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"Could not parse manifest: {e}", file=sys.stderr)
+        return 1
+
+    entries = manifest.get("entries", [])
+    to_restore = [e for e in entries if e.get("existed_before")]
+    to_delete = [e for e in entries if not e.get("existed_before")]
+
+    print("=" * 72)
+    print(f"Restore plan — backup at {backup_path}")
+    print("=" * 72)
+    print(f"Original migration: {manifest.get('direction', '?')}")
+    print(f"Backup created:     {manifest.get('created_at', '?')}")
+    print()
+    print(f"Will restore {len(to_restore)} file(s) (overwriting current state):")
+    for e in to_restore:
+        print(f"  ← {e['original']}")
+    print()
+    print(f"Will delete {len(to_delete)} file(s) (created by the migration):")
+    for e in to_delete:
+        print(f"  ✗ {e['original']}")
+    print()
+
+    if interactive and not ask_yn("Proceed with restore?", True):
+        print("Aborted.")
+        return 0
+
+    restored, deleted, missing = [], [], []
+    for e in to_restore:
+        backup_file = backup_path / e["relative"]
+        original = Path(e["original"])
+        if not backup_file.exists():
+            missing.append(e["original"])
+            continue
+        if dry_run:
+            print(f"[dry-run] restore {backup_file} → {original}")
+        else:
+            original.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup_file, original)
+        restored.append(e["original"])
+
+    for e in to_delete:
+        original = Path(e["original"])
+        if not original.exists():
+            continue
+        if dry_run:
+            print(f"[dry-run] delete {original}")
+        else:
+            original.unlink()
+        deleted.append(e["original"])
+
+    print()
+    print(f"Restored: {len(restored)}")
+    print(f"Deleted:  {len(deleted)}")
+    if missing:
+        print(f"WARNING — backup files missing for: {missing}", file=sys.stderr)
+        return 2
+    return 0
+
+
 def _resolve_pairs(args: argparse.Namespace) -> list[tuple[Path, Path, Path | None, Path | None]]:
     if args.claude_dir or args.codex_dir:
         claude = Path(args.claude_dir).expanduser() if args.claude_dir else Path.home() / ".claude"
@@ -1082,8 +1213,14 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument("--direction", required=True,
-                    choices=["claude-to-codex", "codex-to-claude"])
+    ap.add_argument("--direction",
+                    choices=["claude-to-codex", "codex-to-claude"],
+                    help="Direction to migrate.")
+    ap.add_argument("--restore", nargs="?", const="__latest__",
+                    metavar="BACKUP_DIR",
+                    help="Restore from a previous migration backup. Pass a "
+                    "specific backup directory, or omit to use the latest "
+                    "one under ~/.claude/backups or ~/.codex/backups.")
     ap.add_argument("--scope", choices=["user", "project", "both"],
                     default="user")
     ap.add_argument("--claude-dir")
@@ -1093,21 +1230,41 @@ def main() -> int:
     mg.add_argument("--merge", dest="merge", action="store_true", default=True)
     mg.add_argument("--overwrite", dest="merge", action="store_false")
     ap.add_argument("--no-backup", dest="backup", action="store_false", default=True)
-    ap.add_argument("--no-interactive", action="store_true",
-                    help="Don't prompt; use --apply-lossy / --skip-lossy "
-                    "(default: apply all detected lossy translations).")
+    ap.add_argument("--no-interactive", action="store_true")
     ap.add_argument("--apply-lossy", metavar="IDS",
-                    help="Comma-separated Tier B IDs to apply unconditionally "
-                    "(or 'all'). IDs: " + ", ".join(o.id for o in TIER_B))
+                    help="Comma-separated Tier B IDs to apply (or 'all'). "
+                    "IDs: " + ", ".join(o.id for o in TIER_B))
     ap.add_argument("--skip-lossy", metavar="IDS",
-                    help="Comma-separated Tier B IDs to skip unconditionally "
-                    "(or 'all').")
+                    help="Comma-separated Tier B IDs to skip (or 'all').")
     args = ap.parse_args()
 
+    if not args.direction and args.restore is None:
+        ap.error("either --direction or --restore is required")
+    if args.direction and args.restore is not None:
+        ap.error("--direction and --restore are mutually exclusive")
+
+    interactive_default = not args.no_interactive and is_interactive()
+
+    # ---- Restore mode ------------------------------------------------------
+    if args.restore is not None:
+        if args.restore == "__latest__":
+            backup_path = find_latest_backup()
+            if not backup_path:
+                print("No backups found under ~/.claude/backups or "
+                      "~/.codex/backups.", file=sys.stderr)
+                return 1
+            print(f"Using latest backup: {backup_path}")
+        else:
+            backup_path = Path(args.restore).expanduser()
+            if not backup_path.is_dir():
+                print(f"Not a directory: {backup_path}", file=sys.stderr)
+                return 1
+        return restore_from_backup(backup_path, interactive_default, args.dry_run)
+
+    # ---- Migrate mode ------------------------------------------------------
     apply_set = _csv_set(args.apply_lossy)
     skip_set = _csv_set(args.skip_lossy)
-    interactive = not args.no_interactive and is_interactive() \
-        and not (apply_set or skip_set)
+    interactive = interactive_default and not (apply_set or skip_set)
 
     direction_key = "c2x" if args.direction == "claude-to-codex" else "x2c"
     pairs = _resolve_pairs(args)
@@ -1133,14 +1290,58 @@ def main() -> int:
                   dry_run=args.dry_run, merge=args.merge,
                   backup=args.backup, report=report)
 
+        # Step 1: interactive preflight (decides which Tier B items run).
         decisions = preflight(ctx, direction_key, apply_set, skip_set, interactive)
 
-        print(f"\n--- Running: {label}")
+        # Step 2: PLAN pass — collect every destination path that will be
+        # touched, without writing anything.
+        ctx.plan_mode = True
+        if direction_key == "c2x":
+            run_claude_to_codex(ctx, decisions)
+        else:
+            run_codex_to_claude(ctx, decisions)
+        planned = sorted(ctx.planned_writes)
+
+        print()
+        print("Planned destination files ({}):".format(len(planned)))
+        for p in planned:
+            tag = "modify" if p.exists() else "create"
+            print(f"  [{tag}] {p}")
+        print()
+
+        # Step 3: BACKUP everything that already exists + write manifest.
+        if args.backup and planned and not args.dry_run:
+            backup_root = perform_backup(ctx)
+            if backup_root:
+                print(f"Backup written to: {backup_root}")
+                print(f"  manifest: {backup_root / 'manifest.json'}")
+                print(f"  to restore later: "
+                      f"python3 migrate.py --restore {backup_root}")
+                print()
+        elif args.backup and args.dry_run:
+            perform_backup(ctx)  # populates report.backups with "would back up" notes
+
+        if interactive and not ask_yn("Apply migration?", True):
+            print("Aborted by user (no changes written; backup retained).")
+            continue
+
+        # Reset Tier B report state from the plan pass (apply pass will re-add).
+        ctx.report.migrated_clean.clear()
+        ctx.report.migrated_lossy.clear()
+        ctx.report.skipped_by_user.clear()
+        ctx.report.skipped_unmappable.clear()
+        ctx.report.notes.clear()
+
+        # Step 4: APPLY pass — really write.
+        ctx.plan_mode = False
+        ctx.planned_writes.clear()
+        print(f"--- Running: {label}")
         if direction_key == "c2x":
             run_claude_to_codex(ctx, decisions)
         else:
             run_codex_to_claude(ctx, decisions)
 
+        # Step 5: write report.
         if not args.dry_run:
             dst_root.mkdir(parents=True, exist_ok=True)
             (dst_root / "MIGRATION_REPORT.md").write_text(

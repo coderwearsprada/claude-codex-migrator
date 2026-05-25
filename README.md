@@ -8,6 +8,12 @@ to undo a run.
 
 Requires Python 3.11+ (uses `tomllib`). No third-party dependencies.
 
+**Tested against:** Claude Code `2.1.150` and Codex CLI `0.133.0` (2026-05).
+The script reads documented config schemas (`~/.claude/settings.json`,
+`~/.codex/config.toml`, etc.), so minor version bumps should keep working;
+if a future release renames or removes a key, the migrator will flag it as
+"not translated" in the report rather than corrupt your config.
+
 ## Usage
 
 ```bash

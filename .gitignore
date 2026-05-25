@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Local Claude Code session state
+.claude/
+
+# Migration artifacts
+MIGRATION_REPORT.md
+backups/

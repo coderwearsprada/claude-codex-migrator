@@ -14,6 +14,12 @@ dependencies.
 python3 migrate.py --direction claude-to-codex
 python3 migrate.py --direction codex-to-claude
 
+# Revert the most recent migration (uses the latest backup found under
+# ~/.claude/backups or ~/.codex/backups). Pass a specific backup directory
+# to restore from a particular run.
+python3 migrate.py --restore
+python3 migrate.py --restore /path/to/backups/pre-migrate-YYYYMMDD-HHMMSS
+
 # Project-level: ./.claude  <->  ./.codex  (plus ./CLAUDE.md / ./AGENTS.md)
 python3 migrate.py --direction claude-to-codex --scope project
 
@@ -71,6 +77,45 @@ The script ignores state, secrets, and caches on the source side, including:
   `paste-cache/`, `shell-snapshots/`, `telemetry/`, `.credentials.json`,
   `mcp-needs-auth-cache.json`
 - Codex: `auth.json`, `history.jsonl`, `sessions/`, `log/`, `version.json`
+
+## How a migration runs
+
+1. **Preflight scan** — detects Tier B (lossy) translations and asks you
+   to confirm each one. Tier A (clean) translations are always applied.
+2. **Plan pass** — walks the migration once without writing anything,
+   collecting the full list of destination files that will be touched.
+3. **Backup** — copies every planned destination that already exists into
+   `<dst>/backups/pre-migrate-<timestamp>/` and writes a `manifest.json`
+   that `--restore` later reads to put things back.
+4. **Confirm** — shows the list of planned changes and the backup location
+   and asks one final time before applying.
+5. **Apply** — actually writes; produces `MIGRATION_REPORT.md` at the
+   destination summarizing what was migrated, what was lossy, what the
+   user skipped, and what couldn't be translated.
+
+## Restoring a migration
+
+If something went wrong, `--restore` reverses the most recent migration:
+files that existed before are copied back from the backup byte-for-byte,
+and files the migration created are deleted. Pass an explicit backup
+directory to revert a specific run instead of the latest.
+
+```bash
+python3 migrate.py --restore                    # latest backup
+python3 migrate.py --restore /path/to/backup    # specific run
+python3 migrate.py --restore --dry-run          # preview only
+```
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+Tests are stdlib-only (uses `unittest`). They cover the TOML writer,
+frontmatter and fenced-block round-trips, the MCP normalization rules,
+both Tier A directions, every Tier B heuristic, the plan-mode contract,
+and the backup-then-restore round-trip end to end.
 
 ## License
 

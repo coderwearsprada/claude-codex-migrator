@@ -3,12 +3,40 @@
 migrate.py — Migrate settings + custom configuration between Claude Code
 (~/.claude) and Codex CLI (~/.codex), in either direction.
 
-Requires Python 3.11+ (uses tomllib).
+Requires Python 3.11+ (uses tomllib). No third-party dependencies.
 
 Usage:
     python3 migrate.py --direction claude-to-codex
     python3 migrate.py --direction codex-to-claude
+    python3 migrate.py --restore [BACKUP_DIR]      # revert a previous run
     # See --help for full options.
+
+Design overview
+---------------
+Migration runs in five phases:
+
+  1. **Preflight scan**  — detect Tier B (lossy) translations and let the
+     user accept/skip each one. Tier A (clean) items are always applied.
+  2. **Plan pass**       — re-run the migration with `Ctx.plan_mode=True`;
+     write helpers record destination paths into `Ctx.planned_writes`
+     instead of touching the filesystem. This produces a complete list of
+     destination files *before* any writes happen.
+  3. **Backup**          — copy every planned path that already exists into
+     `<dst>/backups/pre-migrate-<timestamp>/`, preserving relative layout,
+     and write a `manifest.json` recording each entry's `existed_before`
+     flag. `--restore` later uses this to reverse the migration.
+  4. **Confirm**         — show the user the planned changes and ask one
+     final time before any writes.
+  5. **Apply pass**      — run the migration again with `plan_mode=False`;
+     write helpers actually write. Each function re-reads the destination
+     from disk, so layered writes (e.g., Tier A then Tier B both touching
+     settings.json) compose correctly.
+
+The round-trippable pieces of content (Codex `instructions`, Claude
+`outputStyle` files, slash-command frontmatter `description`/
+`argument-hint`) ride along inside HTML comments that the reverse
+direction recognizes and unwraps. See the `fenced_block` / `extract_fenced`
+and `frontmatter_to_meta_comment` / `meta_comment_to_frontmatter` helpers.
 """
 
 from __future__ import annotations
@@ -67,6 +95,11 @@ EFFORT_X2C = {"minimal": "low", "low": "low", "medium": "medium", "high": "high"
 # ============================================================================
 # Tiny TOML writer
 # ============================================================================
+# Python's stdlib has `tomllib` for reading TOML but no writer. We only need
+# to emit a small, well-defined subset (top-level scalars, nested tables for
+# `[mcp_servers.NAME]` / `[sandbox_workspace_write]` / etc., arrays of
+# strings, and small inline tables for env-style maps), so a hand-rolled
+# writer beats taking on a dependency.
 
 def _toml_escape(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"'
@@ -97,10 +130,15 @@ def _toml_value(v: Any) -> str:
 
 
 def _is_inline_dict(d: dict) -> bool:
+    """A dict with no nested dicts is rendered as an inline `{ k = v, ... }`
+    table instead of as a `[parent.child]` section header. This keeps small
+    env-style maps (`env = { K = "v" }`) compact and is also what Codex'
+    documented schema uses for things like `shell_environment_policy.set`."""
     return all(not isinstance(v, dict) for v in d.values())
 
 
 def render_toml(data: dict) -> str:
+    """Render a (nested) dict to a TOML string parseable by `tomllib`."""
     lines: list[str] = []
     scalars = {k: v for k, v in data.items() if not isinstance(v, dict)}
     tables = {k: v for k, v in data.items() if isinstance(v, dict)}
@@ -153,7 +191,13 @@ def strip_frontmatter(text: str) -> tuple[str, dict | None]:
 
 
 def meta_comment_to_frontmatter(text: str) -> tuple[str, dict | None]:
-    """Pull a top-level <!-- migrator:meta key="v" ... --> into a frontmatter dict."""
+    """Inverse of frontmatter_to_meta_comment().
+
+    Codex prompts don't have a frontmatter spec, but slash-command authors
+    rely on Claude's `description` and `argument-hint` keys. We smuggle
+    those across as a `<!-- migrator:meta ... -->` HTML comment so a
+    Codex→Claude pass can reconstruct the frontmatter byte-for-byte.
+    """
     m = MIGRATOR_META_RE.match(text)
     if not m:
         return text, None
@@ -178,13 +222,18 @@ def make_frontmatter(d: dict) -> str:
 
 
 def fenced_block(kind: str, source: str, body: str) -> str:
+    """Wrap content that lives in different shapes on each side (Codex
+    `instructions` as a TOML string vs. Claude `outputStyle` files) in an
+    HTML comment fence so it can be embedded in the target's instruction
+    document and unwrapped on the way back."""
     body = body.rstrip()
     return (f"\n\n{MIGRATOR_BEGIN.format(kind=kind, source=source)}\n"
             f"{body}\n{MIGRATOR_END}\n")
 
 
 def extract_fenced(text: str, kind: str) -> tuple[str, str | None]:
-    """Return (text_with_block_removed, block_body_or_None) for first match of kind."""
+    """Inverse of fenced_block(). Returns (text_with_block_removed,
+    block_body_or_None) for the first matching kind."""
     for m in MIGRATOR_BLOCK_RE.finditer(text):
         if m.group("kind") == kind:
             return text[:m.start()].rstrip() + "\n" + text[m.end():].lstrip(), m.group("body")
@@ -231,6 +280,14 @@ class Report:
 
 @dataclass
 class Ctx:
+    """Shared state for a single source→destination migration pair.
+
+    `plan_mode` is the key knob: when True, write_text/copy_file just
+    record the destination path in `planned_writes` instead of touching
+    disk. The migration is run twice — once in plan mode to discover every
+    file we'll touch (so we can back them all up upfront), and once in
+    apply mode to actually write.
+    """
     src_root: Path
     dst_root: Path
     src_doc: Path | None
@@ -248,6 +305,8 @@ class Ctx:
 
 
 def write_text(ctx: Ctx, path: Path, content: str) -> None:
+    """Write content to `path` — or, in plan_mode, just record that we
+    would. Used by every Tier A/B function that produces output."""
     if ctx.plan_mode:
         ctx.planned_writes.add(path)
         return
@@ -272,7 +331,18 @@ def copy_file(ctx: Ctx, src: Path, dst: Path) -> None:
 
 
 def perform_backup(ctx: Ctx) -> Path | None:
-    """Back up every planned destination + write a manifest. Returns backup dir."""
+    """Back up every planned destination + write a manifest. Returns the
+    backup dir (or None on dry-run / nothing to back up).
+
+    The manifest records, for each planned destination:
+      - `original`        — absolute path on disk
+      - `relative`        — path inside the backup directory
+      - `existed_before`  — whether the destination existed pre-migration
+
+    `--restore` uses `existed_before` to decide whether to copy a file
+    back (existing → restore) or delete the destination (newly-created by
+    the migration → remove).
+    """
     if not ctx.backup or not ctx.planned_writes:
         return None
 
@@ -349,6 +419,12 @@ def load_claude_settings(claude_dir: Path) -> dict:
 # ============================================================================
 # Tier A — clean translations (always applied)
 # ============================================================================
+# Tier A translations have a near-1:1 mapping on the other side. They're
+# applied unconditionally and don't trigger any user prompts. Each function
+# is structured so that re-running it after an earlier write reads the
+# updated destination via load_json/load_toml and layers on top — that's
+# what makes plan→backup→apply correct even when multiple translations
+# target the same file (e.g. settings.json).
 
 def tier_a_docs_claude_to_codex(ctx: Ctx) -> None:
     """CLAUDE.md → AGENTS.md, with optional outputStyle content fenced in."""
@@ -450,6 +526,8 @@ def tier_a_prompts_to_commands(ctx: Ctx) -> None:
 
 
 def _normalize_mcp_claude_to_codex(name: str, spec: dict, report: Report) -> dict | None:
+    """Codex only speaks stdio MCP; Claude's SSE/HTTP servers can't be
+    represented and get reported as skipped."""
     t = (spec.get("type") or "stdio").lower()
     if t != "stdio":
         report.skipped_unmappable.append(
@@ -574,6 +652,12 @@ def tier_a_settings_codex_to_claude(ctx: Ctx) -> None:
 # ============================================================================
 # Tier B — lossy translations (user-confirmed)
 # ============================================================================
+# Tier B items don't have an exact equivalent on the other side, so the
+# migration is heuristic. Each option's `detect` says whether the relevant
+# source state exists, `preview` produces a one-line "here's what will
+# happen" string for the preflight UI, and `apply` performs the
+# translation. The user accepts or skips each one (interactively, or via
+# --apply-lossy / --skip-lossy in non-interactive mode).
 
 @dataclass
 class LossyOption:
@@ -603,6 +687,11 @@ def _preview_claude_permissions(ctx: Ctx) -> str:
 
 
 def _apply_claude_permissions(ctx: Ctx) -> None:
+    """Heuristic: Claude's per-tool allow/deny patterns are richer than
+    Codex's coarse sandbox modes. We classify the rules into a closest-fit
+    sandbox mode + extract Write() patterns into writable_roots + deny of
+    WebFetch/WebSearch into network_access=false. Round-trip is *not*
+    byte-identical — that's the lossy part."""
     s = load_claude_settings(ctx.src_root).get("permissions", {}) or {}
     allow = s.get("allow") or []
     deny = s.get("deny") or []
@@ -721,13 +810,18 @@ def _preview_claude_notify_hook(ctx: Ctx) -> str:
 
 
 def _extract_first_command(entries: list) -> list[str] | None:
-    """Claude hook shape: [{matcher, hooks: [{type:'command', command:'...'}]}]."""
+    """Extract the first runnable shell command from a Claude hook config.
+
+    Claude hooks are: [{matcher, hooks: [{type:'command', command:'...'}]}].
+    Codex `notify` takes an argv-style list. We wrap the user's shell
+    command in `/bin/sh -c` rather than trying to tokenize it, since
+    Claude commands are meant to be shell-parsed (with redirects, pipes,
+    `$VAR` expansion, etc.).
+    """
     for grp in entries or []:
         for h in (grp.get("hooks") or []) if isinstance(grp, dict) else []:
             if h.get("type") == "command" and h.get("command"):
-                cmd = h["command"]
-                # Codex notify wants a list (argv-style). Best effort split.
-                return ["/bin/sh", "-c", cmd]
+                return ["/bin/sh", "-c", h["command"]]
     return None
 
 
@@ -992,7 +1086,13 @@ def preflight(ctx: Ctx, direction_key: str,
               apply_set: set[str] | None,
               skip_set: set[str] | None,
               interactive: bool) -> dict[str, bool]:
-    """Return {option_id: should_apply} for Tier B options applicable here."""
+    """Phase 1 of migration: scan source, preview Tier A, and decide each
+    Tier B item. Returns {option_id: should_apply} for the apply pass.
+
+    Decision precedence: --apply-lossy/--skip-lossy override all; else if
+    running interactively, ask per item; else accept everything (the
+    non-interactive default is to migrate as much as we can).
+    """
     candidates = [o for o in TIER_B if o.direction == direction_key and o.detect(ctx)]
     decisions: dict[str, bool] = {}
 
@@ -1293,8 +1393,10 @@ def main() -> int:
         # Step 1: interactive preflight (decides which Tier B items run).
         decisions = preflight(ctx, direction_key, apply_set, skip_set, interactive)
 
-        # Step 2: PLAN pass — collect every destination path that will be
-        # touched, without writing anything.
+        # Step 2: PLAN pass — re-run the migration with plan_mode=True so
+        # write_text/copy_file just record destination paths. This lets us
+        # back up the full set of files atomically (and show the user the
+        # complete list of changes) before any writes happen.
         ctx.plan_mode = True
         if direction_key == "c2x":
             run_claude_to_codex(ctx, decisions)
@@ -1325,7 +1427,9 @@ def main() -> int:
             print("Aborted by user (no changes written; backup retained).")
             continue
 
-        # Reset Tier B report state from the plan pass (apply pass will re-add).
+        # The plan pass populated the report (Tier A/B functions don't
+        # know they're being dry-run). Clear those entries so the apply
+        # pass produces a clean report. `backups` is preserved.
         ctx.report.migrated_clean.clear()
         ctx.report.migrated_lossy.clear()
         ctx.report.skipped_by_user.clear()

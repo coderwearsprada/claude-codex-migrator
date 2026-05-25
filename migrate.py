@@ -52,11 +52,167 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+# ----------------------------------------------------------------------------
+# TOML reader compatibility shim
+# ----------------------------------------------------------------------------
+# Python 3.11+ ships `tomllib` in the stdlib. On 3.9/3.10 we fall back to a
+# small hand-rolled parser covering the subset Codex's `config.toml` uses:
+# top-level scalars (strings, bools, ints, floats), `[table]` and
+# `[table.sub]` headers, arrays of scalars, inline `{ k = v, ... }` tables,
+# and `# ...` comments. Anything more exotic (multi-line strings, dates,
+# `[[arrays.of.tables]]`, dotted keys, hex/octal numbers) is unsupported —
+# the migrator doesn't need any of it.
+
 try:
-    import tomllib  # Python 3.11+
+    import tomllib  # type: ignore[import-not-found]  # Python 3.11+
 except ModuleNotFoundError:
-    print("This script requires Python 3.11+ (for tomllib).", file=sys.stderr)
-    sys.exit(1)
+    class _MinimalToml:
+        class TOMLDecodeError(ValueError):
+            pass
+
+        @classmethod
+        def loads(cls, text: str) -> dict:
+            return _toml_minimal_parse(text, cls.TOMLDecodeError)
+
+    def _toml_strip_comment(line: str) -> str:
+        """Strip `# ...` comments, respecting `"..."` strings."""
+        in_str = False
+        esc = False
+        for i, c in enumerate(line):
+            if esc:
+                esc = False
+                continue
+            if c == "\\" and in_str:
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if c == "#" and not in_str:
+                return line[:i].rstrip()
+        return line.rstrip()
+
+    def _toml_skip_ws(s: str, i: int) -> int:
+        while i < len(s) and s[i] in " \t":
+            i += 1
+        return i
+
+    def _toml_parse_string(s: str, i: int, err) -> tuple[str, int]:
+        assert s[i] == '"'
+        i += 1
+        out: list[str] = []
+        while i < len(s):
+            c = s[i]
+            if c == "\\":
+                if i + 1 >= len(s):
+                    raise err("unterminated escape in string")
+                nxt = s[i + 1]
+                out.append({"n": "\n", "t": "\t", "r": "\r",
+                            "\\": "\\", '"': '"', "/": "/"}.get(nxt, nxt))
+                i += 2
+            elif c == '"':
+                return "".join(out), i + 1
+            else:
+                out.append(c)
+                i += 1
+        raise err("unterminated string")
+
+    def _toml_parse_value(s: str, i: int, err) -> tuple[object, int]:
+        i = _toml_skip_ws(s, i)
+        if i >= len(s):
+            raise err("expected value")
+        c = s[i]
+        if c == '"':
+            return _toml_parse_string(s, i, err)
+        if c == "[":
+            return _toml_parse_array(s, i, err)
+        if c == "{":
+            return _toml_parse_inline_table(s, i, err)
+        # Bare token: bool / int / float.
+        start = i
+        while i < len(s) and s[i] not in " \t,]}#":
+            i += 1
+        token = s[start:i]
+        if token == "true":
+            return True, i
+        if token == "false":
+            return False, i
+        try:
+            if any(ch in token for ch in ".eE"):
+                return float(token), i
+            return int(token), i
+        except ValueError:
+            raise err(f"could not parse value: {token!r}")
+
+    def _toml_parse_array(s: str, i: int, err) -> tuple[list, int]:
+        assert s[i] == "["
+        i += 1
+        items: list = []
+        while i < len(s):
+            i = _toml_skip_ws(s, i)
+            if i < len(s) and s[i] == "]":
+                return items, i + 1
+            val, i = _toml_parse_value(s, i, err)
+            items.append(val)
+            i = _toml_skip_ws(s, i)
+            if i < len(s) and s[i] == ",":
+                i += 1
+        raise err("unterminated array")
+
+    def _toml_parse_inline_table(s: str, i: int, err) -> tuple[dict, int]:
+        assert s[i] == "{"
+        i += 1
+        table: dict = {}
+        while i < len(s):
+            i = _toml_skip_ws(s, i)
+            if i < len(s) and s[i] == "}":
+                return table, i + 1
+            if s[i] == ",":
+                i += 1
+                continue
+            key_start = i
+            while i < len(s) and s[i] not in " \t=,}":
+                i += 1
+            key = s[key_start:i].strip()
+            if key.startswith('"') and key.endswith('"') and len(key) >= 2:
+                key = key[1:-1]
+            i = _toml_skip_ws(s, i)
+            if i >= len(s) or s[i] != "=":
+                raise err("expected '=' in inline table")
+            i += 1
+            val, i = _toml_parse_value(s, i, err)
+            table[key] = val
+        raise err("unterminated inline table")
+
+    def _toml_minimal_parse(text: str, err) -> dict:
+        root: dict = {}
+        current: dict = root
+        for raw in text.splitlines():
+            line = _toml_strip_comment(raw).strip()
+            if not line:
+                continue
+            if line.startswith("["):
+                end = line.find("]")
+                if end < 0:
+                    raise err(f"unterminated section header: {line!r}")
+                path = [p.strip() for p in line[1:end].split(".")]
+                current = root
+                for p in path:
+                    if p.startswith('"') and p.endswith('"') and len(p) >= 2:
+                        p = p[1:-1]
+                    current = current.setdefault(p, {})
+                continue
+            eq = line.find("=")
+            if eq < 0:
+                raise err(f"expected key = value, got: {line!r}")
+            key = line[:eq].strip()
+            if key.startswith('"') and key.endswith('"') and len(key) >= 2:
+                key = key[1:-1]
+            value, _ = _toml_parse_value(line, eq + 1, err)
+            current[key] = value
+        return root
+
+    tomllib = _MinimalToml()  # type: ignore[assignment]
 
 
 # ============================================================================

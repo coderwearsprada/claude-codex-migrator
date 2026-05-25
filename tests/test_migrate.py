@@ -7,7 +7,8 @@ Run with:
     python3 tests/test_migrate.py
 
 Uses only the standard library (matches the migrator's stdlib-only stance).
-Requires Python 3.11+ for tomllib.
+Works on Python 3.9+ (uses migrate.py's TOML reader fallback when stdlib
+`tomllib` isn't available).
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import json
 import shutil
 import sys
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 
@@ -25,6 +25,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import migrate as m  # noqa: E402
+
+# Use whichever TOML reader migrate.py chose (stdlib on 3.11+,
+# hand-rolled fallback on 3.9/3.10). Both expose `.loads(text)`.
+tomllib = m.tomllib
 
 
 def make_ctx(src: Path, dst: Path, **overrides) -> m.Ctx:

@@ -6,7 +6,9 @@ between [Claude Code](https://claude.com/claude-code) (`~/.claude`) and
 with an upfront backup of every file it will touch and a `--restore` command
 to undo a run.
 
-Requires Python 3.11+ (uses `tomllib`). No third-party dependencies.
+Requires Python 3.9+. No third-party dependencies. On 3.11+ it uses the
+stdlib `tomllib`; on 3.9/3.10 it falls back to a small bundled TOML reader
+covering the subset Codex's `config.toml` uses.
 
 **Tested against:** Claude Code `2.1.150` and Codex CLI `0.133.0` (2026-05).
 The script reads documented config schemas (`~/.claude/settings.json`,

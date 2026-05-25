@@ -2,10 +2,11 @@
 
 A single-file Python script that migrates settings and custom configuration
 between [Claude Code](https://claude.com/claude-code) (`~/.claude`) and
-[Codex CLI](https://github.com/openai/codex) (`~/.codex`), in either direction.
+[Codex CLI](https://github.com/openai/codex) (`~/.codex`), in either direction —
+with an upfront backup of every file it will touch and a `--restore` command
+to undo a run.
 
-Requires Python 3.11+ (uses `tomllib` from the standard library). No third-party
-dependencies.
+Requires Python 3.11+ (uses `tomllib`). No third-party dependencies.
 
 ## Usage
 
@@ -13,12 +14,6 @@ dependencies.
 # User-level config (default): ~/.claude  <->  ~/.codex
 python3 migrate.py --direction claude-to-codex
 python3 migrate.py --direction codex-to-claude
-
-# Revert the most recent migration (uses the latest backup found under
-# ~/.claude/backups or ~/.codex/backups). Pass a specific backup directory
-# to restore from a particular run.
-python3 migrate.py --restore
-python3 migrate.py --restore /path/to/backups/pre-migrate-YYYYMMDD-HHMMSS
 
 # Project-level: ./.claude  <->  ./.codex  (plus ./CLAUDE.md / ./AGENTS.md)
 python3 migrate.py --direction claude-to-codex --scope project
@@ -32,76 +27,116 @@ python3 migrate.py --direction claude-to-codex \
 
 # Preview without writing anything
 python3 migrate.py --direction claude-to-codex --dry-run
+
+# Revert the most recent migration (or pass a specific backup directory)
+python3 migrate.py --restore
+python3 migrate.py --restore /path/to/backups/pre-migrate-YYYYMMDD-HHMMSS
 ```
 
-Other flags:
+### Flags
 
-- `--merge` (default) — merge into existing destination files where sensible;
-  conflicts are backed up first.
-- `--overwrite` — replace destination files outright (after backup).
-- `--no-backup` — skip backups (not recommended).
-- `--include-agents` — best-effort, lossy conversion of Claude subagents
-  (`agents/*.md`) into Codex prompts (`prompts/agent-*.md`).
+| Flag | Meaning |
+|---|---|
+| `--direction {claude-to-codex,codex-to-claude}` | Direction to migrate. Required unless `--restore` is given. |
+| `--restore [BACKUP_DIR]` | Reverse a previous migration. Omit `BACKUP_DIR` to use the latest backup found under `~/.claude/backups` or `~/.codex/backups`. |
+| `--scope {user,project,both}` | Which config scope(s) to migrate (default: `user`). |
+| `--claude-dir PATH` / `--codex-dir PATH` | Explicit config dirs; overrides `--scope`. |
+| `--dry-run` | Print the plan and report, write nothing. |
+| `--merge` / `--overwrite` | Merge into existing destination files where sensible (default), or replace outright. Backups happen either way. |
+| `--no-backup` | Skip the upfront backup (and disable `--restore` for this run). Not recommended. |
+| `--no-interactive` | Don't prompt for Tier B confirmations; combine with `--apply-lossy`/`--skip-lossy`. |
+| `--apply-lossy=IDS` / `--skip-lossy=IDS` | Comma-separated Tier B option IDs (or `all`). IDs: `permissions`, `sandbox`, `hooks`, `notify`, `agents`, `skills`, `profiles`. |
 
-After each run the script writes `MIGRATION_REPORT.md` at the destination
-listing what was migrated, what was skipped, and where backups live.
+After each run the script writes `MIGRATION_REPORT.md` at the destination,
+split into: migrated cleanly (Tier A), migrated with loss (Tier B, user-
+confirmed), skipped by user choice, and not translated (no equivalent).
 
-## What maps
+## What gets translated
 
-| Claude Code                     | Codex CLI                          |
-|---------------------------------|------------------------------------|
-| `CLAUDE.md`                     | `AGENTS.md`                        |
-| `commands/*.md`                 | `prompts/*.md`                     |
-| `settings.json:mcpServers`      | `config.toml:[mcp_servers.*]`      |
-| `settings.json:model`           | `config.toml:model`                |
-| `agents/*.md` (opt-in, lossy)   | `prompts/agent-*.md`               |
+### Tier A — clean, always applied
 
-YAML frontmatter on slash commands is stripped (Codex prompts don't use it).
-SSE / HTTP MCP servers on the Claude side are flagged as unsupported in Codex.
+| Claude Code                            | Codex CLI                                  |
+|----------------------------------------|--------------------------------------------|
+| `CLAUDE.md`                            | `AGENTS.md`                                |
+| `commands/*.md`                        | `prompts/*.md`                             |
+| `settings.json:model`                  | `config.toml:model`                        |
+| `settings.json:mcpServers` (stdio)     | `config.toml:[mcp_servers.*]`              |
+| `settings.json:env`                    | `config.toml:[shell_environment_policy] set` |
+| `settings.json:effortLevel`            | `config.toml:model_reasoning_effort`       |
+| `outputStyle` file contents *(c→x only)*  | fenced block inside `AGENTS.md`         |
+| fenced block inside `CLAUDE.md` *(x→c only)* | `config.toml:instructions`           |
 
-## What does **not** map
+Notes:
 
-These are listed in the migration report so you know what to recreate by hand:
+- Slash-command frontmatter `description` and `argument-hint` ride along
+  inside a `<!-- migrator:meta ... -->` comment so they survive a c→x→c
+  round-trip byte-for-byte. Other frontmatter keys (`model`,
+  `allowed-tools`, …) are dropped and logged.
+- Codex `instructions` (TOML string) and Claude `outputStyle` files
+  (markdown) are different shapes for similar things, so they're embedded
+  inside the target's instruction document as a `<!-- migrator:begin ... -->`
+  fenced block that the reverse direction can unwrap.
+- Only **stdio** MCP servers transfer. Claude SSE/HTTP MCP servers are
+  flagged as unsupported in Codex.
+- Effort levels map: `max ↔ high`, `minimal → low`, others 1:1.
 
-- **Claude-only:** hooks, permissions, `statusLine`, env, `skills/`,
-  `plugins/`, output styles, slash-command frontmatter (`allowed-tools`, etc.)
-- **Codex-only:** profiles, `approval_policy`, `sandbox_mode` /
-  `sandbox_workspace_write`, `shell_environment_policy`, `model_provider(s)`,
-  `reasoning_effort`, `tools.web_search`, history persistence
+### Tier B — lossy, user-confirmed
+
+These don't have an exact equivalent on the other side. The preflight scan
+shows a one-line preview and rationale for each detected item and lets you
+accept or skip per-item (interactively, or via `--apply-lossy`/`--skip-lossy`).
+
+| ID | Translation | Why lossy |
+|---|---|---|
+| `permissions` | Claude `permissions` → Codex `sandbox_mode` + `approval_policy` + `sandbox_workspace_write` | Per-tool regex patterns collapsed into coarse sandbox modes; `Write()` patterns become `writable_roots`; `WebFetch`/`WebSearch` deny becomes `network_access=false`. |
+| `sandbox` | Codex `sandbox_mode`/`approval_policy` → Claude `permissions.allow`/`deny` | Coarse modes expanded into Claude wildcard patterns. Round-trip is semantic, not byte-identical. |
+| `hooks` | Claude `hooks.Notification`/`Stop` → Codex `notify` | Only the notification-style hook events translate; `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`/`PreCompact` are Claude-only and get listed in the report. The shell command is wrapped as `["/bin/sh", "-c", ...]`. |
+| `notify` | Codex `notify` → Claude `hooks.Notification` | Single command with no matcher. |
+| `agents` | Claude `agents/*.md` → Codex `prompts/agent-*.md` (one-way) | Codex has no subagent runtime; each subagent file is flattened into a plain prompt with a header comment preserving the original frontmatter. |
+| `skills` | Claude `skills/*/SKILL.md` → Codex `prompts/skill-*.md` (one-way) | `SKILL.md` becomes a flat prompt; bundled assets are not migrated and auto-discovery is lost. |
+| `profiles` | Codex `[profiles.NAME]` → `~/.claude/profiles/NAME.settings.json` (one-way) | Claude has no profile runtime; each Codex profile is materialized as a standalone settings file you can copy over `settings.json` to activate. |
+
+### Tier C — not translated
+
+Listed in `MIGRATION_REPORT.md` so you know to recreate them by hand:
+
+- **Claude-only:** `statusLine`, `plugins/`, theme, slash-command `model`/`allowed-tools` frontmatter, and the hook event types listed above.
+- **Codex-only:** `model_provider(s)`, `tools.web_search`, `disable_response_storage` / history persistence, `tui` settings, `hide_agent_reasoning`, `project_doc_max_bytes`.
 
 ## What is never touched
 
 The script ignores state, secrets, and caches on the source side, including:
 
-- Claude: `history.jsonl`, `sessions/`, `projects/`, `file-history/`, `cache/`,
-  `paste-cache/`, `shell-snapshots/`, `telemetry/`, `.credentials.json`,
-  `mcp-needs-auth-cache.json`
-- Codex: `auth.json`, `history.jsonl`, `sessions/`, `log/`, `version.json`
+- **Claude:** `.credentials.json`, `history.jsonl`, `sessions/`, `projects/`,
+  `file-history/`, `cache/`, `paste-cache/`, `shell-snapshots/`,
+  `telemetry/`, `mcp-needs-auth-cache.json`
+- **Codex:** `auth.json`, `history.jsonl`, `sessions/`, `log/`,
+  `version.json`
 
 ## How a migration runs
 
-1. **Preflight scan** — detects Tier B (lossy) translations and asks you
-   to confirm each one. Tier A (clean) translations are always applied.
-2. **Plan pass** — walks the migration once without writing anything,
-   collecting the full list of destination files that will be touched.
-3. **Backup** — copies every planned destination that already exists into
-   `<dst>/backups/pre-migrate-<timestamp>/` and writes a `manifest.json`
-   that `--restore` later reads to put things back.
-4. **Confirm** — shows the list of planned changes and the backup location
-   and asks one final time before applying.
-5. **Apply** — actually writes; produces `MIGRATION_REPORT.md` at the
-   destination summarizing what was migrated, what was lossy, what the
-   user skipped, and what couldn't be translated.
+1. **Preflight scan** — detect Tier B translations applicable to your
+   source and confirm each one. Tier A items are always applied.
+2. **Plan pass** — walk the migration once without writing anything,
+   collecting the complete list of destination files that will be touched.
+3. **Backup** — copy every planned destination that already exists into
+   `<dst>/backups/pre-migrate-<timestamp>/`, preserving relative layout,
+   and write a `manifest.json` that `--restore` later reads. Files the
+   migration will *create* (vs. modify) are recorded as
+   `existed_before: false` so restore can delete them on revert.
+4. **Confirm** — show the list of planned changes plus the backup
+   location and ask one final time.
+5. **Apply** — write for real; produce `MIGRATION_REPORT.md` at the
+   destination.
 
 ## Restoring a migration
 
-If something went wrong, `--restore` reverses the most recent migration:
-files that existed before are copied back from the backup byte-for-byte,
-and files the migration created are deleted. Pass an explicit backup
-directory to revert a specific run instead of the latest.
+`--restore` reverses a previous migration using the backup manifest: files
+that existed before are copied back from the backup byte-for-byte, and
+files the migration created are deleted.
 
 ```bash
-python3 migrate.py --restore                    # latest backup
+python3 migrate.py --restore                    # latest backup found
 python3 migrate.py --restore /path/to/backup    # specific run
 python3 migrate.py --restore --dry-run          # preview only
 ```
@@ -112,10 +147,11 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-Tests are stdlib-only (uses `unittest`). They cover the TOML writer,
-frontmatter and fenced-block round-trips, the MCP normalization rules,
-both Tier A directions, every Tier B heuristic, the plan-mode contract,
-and the backup-then-restore round-trip end to end.
+Tests are stdlib-only. They cover the TOML writer, frontmatter and
+fenced-block round-trips, MCP normalization, both Tier A directions, the
+slash-command `description`/`argument-hint` round-trip, every Tier B
+heuristic, the plan-mode contract, and the backup-then-restore round-trip
+end to end.
 
 ## License
 

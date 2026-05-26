@@ -806,6 +806,374 @@ def tier_a_settings_codex_to_claude(ctx: Ctx) -> None:
 
 
 # ============================================================================
+# Cursor — I/O helpers + direction drivers
+# ============================================================================
+# Cursor (a VS Code fork) stores its agent config across:
+#   - <cursor_root>/mcp.json                  — MCP servers (same shape as Claude)
+#   - <cursor_root>/rules/*.mdc               — project rules (Markdown +
+#                                                YAML frontmatter)
+#   - <project_root>/.cursorrules             — legacy plain-text rules
+# User scope (~/.cursor) only has global mcp.json. The Cursor IDE settings
+# (themes, keybindings, extensions) live elsewhere and are deliberately out
+# of scope for this migrator — those are editor config, not agent config.
+#
+# We translate by going through a small intermediate: a list[CursorRule]
+# for instruction docs, and a dict[name, McpSpec] for MCP servers. That
+# keeps cursor↔claude and cursor↔codex symmetrical.
+
+CURSOR_RULE_BLOCK_RE = re.compile(
+    r"<!--\s*migrator:begin\s+kind=cursor-rule\s+source=(?P<name>\S+)\s*-->\n"
+    r"(?:<!--\s*migrator:cursor-meta\s+(?P<meta>.*?)\s*-->\n)?"
+    r"(?P<body>.*?)\n?<!--\s*migrator:end\s*-->",
+    re.DOTALL,
+)
+
+
+@dataclass
+class CursorRule:
+    name: str
+    description: str
+    globs: object  # str | list[str] | None
+    always_apply: bool
+    body: str
+
+
+def cursor_project_root_from(cursor_root: Path) -> Path | None:
+    """Cursor's `.cursorrules` (legacy) sits at the project root, alongside
+    the `.cursor/` dir. For a project-scope cursor_root like `./.cursor`,
+    the project root is its parent. For a user-scope root like `~/.cursor`,
+    there is no legacy file location.
+    """
+    if cursor_root.name == ".cursor":
+        return cursor_root.parent
+    return None
+
+
+def cursor_read_mcp(cursor_root: Path) -> dict:
+    p = cursor_root / "mcp.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"warn: {p} not valid JSON ({e}); treating as empty",
+              file=sys.stderr)
+        return {}
+    return data.get("mcpServers") or {}
+
+
+def cursor_write_mcp(servers: dict, cursor_root: Path, ctx: Ctx) -> None:
+    """Write MCP servers into <cursor_root>/mcp.json, merging with any
+    existing `mcpServers` block."""
+    p = cursor_root / "mcp.json"
+    existing: dict = {}
+    if p.exists() and ctx.merge:
+        try:
+            existing = json.loads(p.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            existing = {}
+    existing.setdefault("mcpServers", {})
+    existing["mcpServers"].update(servers)
+    write_text(ctx, p, json.dumps(existing, indent=2) + "\n")
+
+
+def cursor_read_rules(cursor_root: Path) -> list[CursorRule]:
+    """Read both .cursor/rules/*.mdc and legacy <project>/.cursorrules."""
+    rules: list[CursorRule] = []
+    rules_dir = cursor_root / "rules"
+    if rules_dir.is_dir():
+        for f in sorted(rules_dir.rglob("*.mdc")):
+            body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+            fm = fm or {}
+            always = str(fm.get("alwaysApply", "false")).lower() == "true"
+            globs = fm.get("globs")
+            # MDC `globs` may be a comma-separated string or a YAML list;
+            # we only parsed simple `k: v` lines, so commas stay literal.
+            if globs and "," in globs:
+                globs = [g.strip() for g in globs.split(",")]
+            rules.append(CursorRule(
+                name=f.stem,
+                description=fm.get("description", ""),
+                globs=globs,
+                always_apply=always,
+                body=body.strip(),
+            ))
+    project_root = cursor_project_root_from(cursor_root)
+    if project_root:
+        legacy = project_root / ".cursorrules"
+        if legacy.is_file():
+            rules.append(CursorRule(
+                name="_cursorrules_legacy",
+                description="Imported from legacy .cursorrules",
+                globs=None,
+                always_apply=True,
+                body=legacy.read_text(encoding="utf-8").strip(),
+            ))
+    return rules
+
+
+def cursor_rules_to_doc(rules: list[CursorRule]) -> str:
+    """Concatenate Cursor rules into a single instruction doc with fenced
+    metadata so a reverse migration can split them back out."""
+    parts: list[str] = []
+    for r in rules:
+        meta_attrs: list[str] = []
+        if r.description:
+            meta_attrs.append(f'description="{r.description}"')
+        if r.globs is not None:
+            g = r.globs if isinstance(r.globs, str) else ",".join(r.globs)
+            meta_attrs.append(f'globs="{g}"')
+        meta_attrs.append(f'alwaysApply="{str(r.always_apply).lower()}"')
+        parts.append(
+            f"<!-- migrator:begin kind=cursor-rule source={r.name} -->\n"
+            f"<!-- migrator:cursor-meta {' '.join(meta_attrs)} -->\n"
+            f"{r.body}\n"
+            f"<!-- migrator:end -->"
+        )
+    return "\n\n".join(parts)
+
+
+def doc_to_cursor_rules(text: str, default_name: str = "migrated") -> list[CursorRule]:
+    """Inverse of cursor_rules_to_doc(). Any text outside cursor-rule
+    fenced blocks becomes a single `<default_name>.mdc` with alwaysApply
+    true so the content still loads in Cursor."""
+    rules: list[CursorRule] = []
+    spans: list[tuple[int, int]] = []
+    for m in CURSOR_RULE_BLOCK_RE.finditer(text):
+        attrs_str = m.group("meta") or ""
+        attrs = dict(re.findall(
+            r'(\w[\w-]*)="((?:[^"\\]|\\.)*)"', attrs_str))
+        globs = attrs.get("globs")
+        if globs and "," in globs:
+            globs = [g.strip() for g in globs.split(",")]
+        rules.append(CursorRule(
+            name=m.group("name"),
+            description=attrs.get("description", ""),
+            globs=globs,
+            always_apply=attrs.get("alwaysApply", "false").lower() == "true",
+            body=m.group("body").strip(),
+        ))
+        spans.append((m.start(), m.end()))
+
+    # Whatever sits outside the fenced blocks is loose content; package it
+    # as one alwaysApply rule so nothing is silently dropped.
+    leftover_parts: list[str] = []
+    last = 0
+    for s, e in spans:
+        chunk = text[last:s].strip()
+        if chunk:
+            leftover_parts.append(chunk)
+        last = e
+    tail = text[last:].strip()
+    if tail:
+        leftover_parts.append(tail)
+    leftover = "\n\n".join(leftover_parts).strip()
+    if leftover:
+        rules.append(CursorRule(
+            name=default_name, description="Migrated content",
+            globs=None, always_apply=True, body=leftover,
+        ))
+    return rules
+
+
+def cursor_write_rules(rules: list[CursorRule], cursor_root: Path,
+                       ctx: Ctx) -> None:
+    """Write Cursor rules as .mdc files under <cursor_root>/rules/."""
+    rules_dir = cursor_root / "rules"
+    for r in rules:
+        fm: dict = {}
+        if r.description:
+            fm["description"] = r.description
+        if r.globs is not None:
+            fm["globs"] = (r.globs if isinstance(r.globs, str)
+                           else ",".join(r.globs))
+        fm["alwaysApply"] = str(r.always_apply).lower()
+        body = make_frontmatter(fm) + r.body.rstrip() + "\n"
+        write_text(ctx, rules_dir / f"{r.name}.mdc", body)
+
+
+def _cursor_label_mcp(direction: str, mcp: dict) -> str:
+    return (f"mcpServers ({len(mcp)} entr{'y' if len(mcp) == 1 else 'ies'}) "
+            f"{direction}")
+
+
+def _normalize_mcp_for_cursor(spec: dict) -> dict:
+    """Cursor accepts the Claude shape verbatim (stdio + SSE/HTTP). Keep
+    documented keys only — drop anything migrator-internal."""
+    out: dict = {}
+    for k in ("command", "args", "env", "type", "url"):
+        if k in spec and spec[k] is not None:
+            out[k] = spec[k]
+    return out
+
+
+def _native_mcp_from_codex(name: str, spec: dict) -> dict:
+    """Codex stores stdio MCP under a TOML table; produce a Claude/Cursor
+    JSON-shaped dict."""
+    out: dict = {"type": "stdio"}
+    for k in ("command", "args", "env"):
+        if spec.get(k):
+            out[k] = list(spec[k]) if k == "args" else (
+                dict(spec[k]) if k == "env" else spec[k])
+    return out
+
+
+# ---- claude → cursor -------------------------------------------------------
+
+def run_claude_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    # Tier A: instruction doc.
+    src_doc = (ctx.src_doc if ctx.src_doc and ctx.src_doc.exists()
+               else ctx.src_root / "CLAUDE.md")
+    if src_doc.exists():
+        text = src_doc.read_text(encoding="utf-8")
+        rules = doc_to_cursor_rules(text)
+        if rules:
+            cursor_write_rules(rules, ctx.dst_root, ctx)
+            ctx.report.migrated_clean.append(
+                f"{src_doc.name} → {len(rules)} cursor rule file(s)")
+
+    # Tier A: MCP servers (Claude's mcpServers → Cursor's mcp.json).
+    settings = load_claude_settings(ctx.src_root)
+    mcp = settings.get("mcpServers") or {}
+    if mcp:
+        out = {n: _normalize_mcp_for_cursor(s) for n, s in mcp.items()}
+        cursor_write_mcp(out, ctx.dst_root, ctx)
+        ctx.report.migrated_clean.append(_cursor_label_mcp("→ cursor mcp.json", out))
+
+    # Things Cursor has no equivalent for: hooks, permissions, agents,
+    # skills, statusLine, outputStyle, slash commands, plugins.
+    for key in ("hooks", "permissions", "statusLine", "outputStyle"):
+        if settings.get(key):
+            ctx.report.skipped_unmappable.append(
+                f"settings.json:{key} (Cursor has no equivalent)")
+    for sub in ("agents", "skills", "commands", "plugins"):
+        p = ctx.src_root / sub
+        if p.is_dir() and any(p.iterdir()):
+            ctx.report.skipped_unmappable.append(
+                f"{sub}/ (Cursor has no equivalent)")
+
+    # Tier B options applicable in this direction.
+    _run_lossy(ctx, lossy_decisions, "claude->cursor")
+
+
+# ---- cursor → claude -------------------------------------------------------
+
+def run_cursor_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    # Tier A: rules → CLAUDE.md (fenced so the round-trip survives).
+    rules = cursor_read_rules(ctx.src_root)
+    if rules:
+        doc = cursor_rules_to_doc(rules)
+        dst_doc = ctx.dst_doc or (ctx.dst_root / "CLAUDE.md")
+        if dst_doc.exists() and ctx.merge:
+            doc = dst_doc.read_text(encoding="utf-8").rstrip() + "\n\n" + doc
+        write_text(ctx, dst_doc, doc + "\n")
+        ctx.report.migrated_clean.append(
+            f"{len(rules)} cursor rule(s) → {dst_doc.name}")
+
+    # Tier A: MCP.
+    mcp = cursor_read_mcp(ctx.src_root)
+    if mcp:
+        dst = ctx.dst_root / "settings.json"
+        existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+        existing.setdefault("mcpServers", {}).update(
+            {n: _normalize_mcp_for_cursor(s) for n, s in mcp.items()})
+        # Claude expects a `type` key; default to stdio if missing.
+        for n, s in existing["mcpServers"].items():
+            s.setdefault("type", "stdio")
+        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+        ctx.report.migrated_clean.append(
+            _cursor_label_mcp("→ settings.json:mcpServers", mcp))
+
+    _run_lossy(ctx, lossy_decisions, "cursor->claude")
+
+
+# ---- codex → cursor --------------------------------------------------------
+
+def run_codex_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    # Tier A: AGENTS.md → cursor rules.
+    src_doc = (ctx.src_doc if ctx.src_doc and ctx.src_doc.exists()
+               else ctx.src_root / "AGENTS.md")
+    if src_doc.exists():
+        text = src_doc.read_text(encoding="utf-8")
+        rules = doc_to_cursor_rules(text)
+        if rules:
+            cursor_write_rules(rules, ctx.dst_root, ctx)
+            ctx.report.migrated_clean.append(
+                f"{src_doc.name} → {len(rules)} cursor rule file(s)")
+
+    # Tier A: MCP (TOML → Cursor JSON).
+    cfg = load_toml(ctx.src_root / "config.toml")
+    mcp = cfg.get("mcp_servers") or {}
+    if mcp:
+        out = {n: _native_mcp_from_codex(n, s) for n, s in mcp.items()}
+        cursor_write_mcp(out, ctx.dst_root, ctx)
+        ctx.report.migrated_clean.append(_cursor_label_mcp("→ cursor mcp.json", out))
+
+    # Codex-only items with no Cursor equivalent.
+    for k in ("approval_policy", "sandbox_mode", "sandbox_workspace_write",
+              "shell_environment_policy", "profiles",
+              "model_reasoning_effort", "notify"):
+        if k in cfg:
+            ctx.report.skipped_unmappable.append(
+                f"config.toml:{k} (Cursor has no equivalent)")
+
+    _run_lossy(ctx, lossy_decisions, "codex->cursor")
+
+
+# ---- cursor → codex --------------------------------------------------------
+
+def run_cursor_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
+    rules = cursor_read_rules(ctx.src_root)
+    if rules:
+        doc = cursor_rules_to_doc(rules)
+        dst_doc = ctx.dst_doc or (ctx.dst_root / "AGENTS.md")
+        if dst_doc.exists() and ctx.merge:
+            doc = dst_doc.read_text(encoding="utf-8").rstrip() + "\n\n" + doc
+        write_text(ctx, dst_doc, doc + "\n")
+        ctx.report.migrated_clean.append(
+            f"{len(rules)} cursor rule(s) → {dst_doc.name}")
+
+    mcp = cursor_read_mcp(ctx.src_root)
+    if mcp:
+        dst = ctx.dst_root / "config.toml"
+        existing = load_toml(dst) if (ctx.merge and dst.exists()) else {}
+        existing.setdefault("mcp_servers", {})
+        for name, spec in mcp.items():
+            t = (spec.get("type") or "stdio").lower()
+            if t != "stdio":
+                ctx.report.skipped_unmappable.append(
+                    f"MCP server '{name}' uses type='{t}' "
+                    "(Codex only supports stdio)")
+                continue
+            out: dict = {}
+            if "command" in spec:
+                out["command"] = spec["command"]
+            if spec.get("args"):
+                out["args"] = list(spec["args"])
+            if spec.get("env"):
+                out["env"] = dict(spec["env"])
+            if out.get("command"):
+                existing["mcp_servers"][name] = out
+        write_text(ctx, dst, render_toml(existing))
+        ctx.report.migrated_clean.append(
+            _cursor_label_mcp("→ config.toml:[mcp_servers.*]", mcp))
+
+    _run_lossy(ctx, lossy_decisions, "cursor->codex")
+
+
+def _run_lossy(ctx: Ctx, decisions: dict[str, bool], direction_key: str) -> None:
+    """Shared Tier B runner: iterate the catalog, applying detected items
+    the user accepted and recording the rest as declined."""
+    for opt in TIER_B:
+        if opt.direction != direction_key or not opt.detect(ctx):
+            continue
+        if decisions.get(opt.id):
+            opt.apply(ctx)
+        else:
+            ctx.report.skipped_by_user.append(f"{opt.label} (declined)")
+
+
+# ============================================================================
 # Tier B — lossy translations (user-confirmed)
 # ============================================================================
 # Tier B items don't have an exact equivalent on the other side, so the
@@ -818,7 +1186,7 @@ def tier_a_settings_codex_to_claude(ctx: Ctx) -> None:
 @dataclass
 class LossyOption:
     id: str
-    direction: str  # 'c2x' or 'x2c'
+    direction: str  # e.g. 'claude->codex', 'cursor->claude', 'codex->cursor'
     label: str
     rationale: str
     detect: Callable[[Ctx], bool]
@@ -1147,7 +1515,7 @@ def _apply_codex_profiles(ctx: Ctx) -> None:
 TIER_B: list[LossyOption] = [
     LossyOption(
         id="permissions",
-        direction="c2x",
+        direction="claude->codex",
         label="permissions → sandbox_mode + approval_policy",
         rationale=("Claude's per-tool regex permissions don't map exactly to "
                    "Codex's coarse sandbox modes. We infer the closest match."),
@@ -1157,7 +1525,7 @@ TIER_B: list[LossyOption] = [
     ),
     LossyOption(
         id="sandbox",
-        direction="x2c",
+        direction="codex->claude",
         label="sandbox_mode/approval_policy → permissions",
         rationale=("Codex's coarse sandbox mode is expanded into a set of "
                    "Claude allow/deny patterns. Round-trip is not exact."),
@@ -1167,7 +1535,7 @@ TIER_B: list[LossyOption] = [
     ),
     LossyOption(
         id="hooks",
-        direction="c2x",
+        direction="claude->codex",
         label="hooks.Notification/Stop → notify",
         rationale=("Codex `notify` covers a subset of Claude's hook events. "
                    "Other hook types (PreToolUse, etc.) are dropped."),
@@ -1177,7 +1545,7 @@ TIER_B: list[LossyOption] = [
     ),
     LossyOption(
         id="notify",
-        direction="x2c",
+        direction="codex->claude",
         label="notify → hooks.Notification",
         rationale=("Codex's single notify program is registered as a Claude "
                    "Notification hook without a matcher."),
@@ -1187,7 +1555,7 @@ TIER_B: list[LossyOption] = [
     ),
     LossyOption(
         id="agents",
-        direction="c2x",
+        direction="claude->codex",
         label="agents/ → prompts/agent-*.md",
         rationale=("Codex has no subagent system. Each agent.md is flattened "
                    "into a plain prompt; the subagent runtime is lost."),
@@ -1197,7 +1565,7 @@ TIER_B: list[LossyOption] = [
     ),
     LossyOption(
         id="skills",
-        direction="c2x",
+        direction="claude->codex",
         label="skills/ → prompts/skill-*.md",
         rationale=("Codex has no skills system. SKILL.md becomes a flat prompt; "
                    "bundled assets are not migrated and skill auto-discovery is lost."),
@@ -1207,7 +1575,7 @@ TIER_B: list[LossyOption] = [
     ),
     LossyOption(
         id="profiles",
-        direction="x2c",
+        direction="codex->claude",
         label="[profiles.*] → ~/.claude/profiles/*.settings.json",
         rationale=("Claude has no profile runtime. Each Codex profile is "
                    "materialized as a standalone settings file you can copy "
@@ -1319,16 +1687,8 @@ def run_claude_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     tier_a_docs_claude_to_codex(ctx)
     tier_a_commands_to_prompts(ctx)
     tier_a_settings_claude_to_codex(ctx)
+    _run_lossy(ctx, lossy_decisions, "claude->codex")
 
-    for opt in TIER_B:
-        if opt.direction != "c2x" or not opt.detect(ctx):
-            continue
-        if lossy_decisions.get(opt.id):
-            opt.apply(ctx)
-        else:
-            ctx.report.skipped_by_user.append(f"{opt.label} (declined)")
-
-    # Items declared unmappable but not yet noted via settings pass.
     for sub in ("plugins",):
         p = ctx.src_root / sub
         if p.is_dir() and any(p.iterdir()):
@@ -1339,19 +1699,21 @@ def run_codex_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     tier_a_docs_codex_to_claude(ctx)
     tier_a_prompts_to_commands(ctx)
     tier_a_settings_codex_to_claude(ctx)
-
-    for opt in TIER_B:
-        if opt.direction != "x2c" or not opt.detect(ctx):
-            continue
-        if lossy_decisions.get(opt.id):
-            opt.apply(ctx)
-        else:
-            ctx.report.skipped_by_user.append(f"{opt.label} (declined)")
+    _run_lossy(ctx, lossy_decisions, "codex->claude")
 
 
-# ============================================================================
-# CLI
-# ============================================================================
+# Dispatch table for (from_tool, to_tool) pairs. All six directed pairs of
+# {claude, codex, cursor} are populated; same-tool pairs are rejected at the
+# CLI before reaching this dict.
+RUNNERS: dict[tuple[str, str], Callable[[Ctx, dict[str, bool]], None]] = {
+    ("claude", "codex"):  run_claude_to_codex,
+    ("codex",  "claude"): run_codex_to_claude,
+    ("claude", "cursor"): run_claude_to_cursor,
+    ("cursor", "claude"): run_cursor_to_claude,
+    ("codex",  "cursor"): run_codex_to_cursor,
+    ("cursor", "codex"):  run_cursor_to_codex,
+}
+
 
 # ============================================================================
 # Restore
@@ -1443,19 +1805,34 @@ def restore_from_backup(backup_path: Path, interactive: bool,
     return 0
 
 
-def _resolve_pairs(args: argparse.Namespace) -> list[tuple[Path, Path, Path | None, Path | None]]:
-    if args.claude_dir or args.codex_dir:
-        claude = Path(args.claude_dir).expanduser() if args.claude_dir else Path.home() / ".claude"
-        codex = Path(args.codex_dir).expanduser() if args.codex_dir else Path.home() / ".codex"
-        return [(claude, codex, None, None)]
-    pairs: list[tuple[Path, Path, Path | None, Path | None]] = []
-    if args.scope in ("user", "both"):
-        pairs.append((Path.home() / ".claude", Path.home() / ".codex", None, None))
-    if args.scope in ("project", "both"):
-        cwd = Path.cwd()
-        pairs.append((cwd / ".claude", cwd / ".codex",
-                      cwd / "CLAUDE.md", cwd / "AGENTS.md"))
-    return pairs
+TOOLS = ("claude", "codex", "cursor")
+
+
+def _tool_paths(tool: str, scope: str, override_dir: str | None) -> dict:
+    """Return {'root': Path, 'doc': Path | None} for a tool at a given scope.
+
+    `root`  — the tool's configuration dir for this scope.
+    `doc`   — the conventional project instruction file alongside (e.g.
+              ./CLAUDE.md or ./AGENTS.md). None when not applicable
+              (user scope, or tools without a sibling doc).
+    """
+    if override_dir:
+        return {"root": Path(override_dir).expanduser(), "doc": None}
+    home = Path.home()
+    cwd = Path.cwd()
+    if tool == "claude":
+        return ({"root": home / ".claude", "doc": None} if scope == "user"
+                else {"root": cwd / ".claude", "doc": cwd / "CLAUDE.md"})
+    if tool == "codex":
+        return ({"root": home / ".codex", "doc": None} if scope == "user"
+                else {"root": cwd / ".codex", "doc": cwd / "AGENTS.md"})
+    if tool == "cursor":
+        # Cursor has no user-level rules — only global MCP at ~/.cursor/mcp.json.
+        # Project rules live in <repo>/.cursor/rules/*.mdc and the legacy
+        # <repo>/.cursorrules sits alongside.
+        return ({"root": home / ".cursor", "doc": None} if scope == "user"
+                else {"root": cwd / ".cursor", "doc": cwd / ".cursorrules"})
+    raise ValueError(f"unknown tool: {tool}")
 
 
 def _csv_set(s: str | None) -> set[str] | None:
@@ -1469,18 +1846,23 @@ def main() -> int:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    ap.add_argument("--from", dest="from_tool", choices=TOOLS,
+                    help="Source tool to migrate from.")
+    ap.add_argument("--to", dest="to_tool", choices=TOOLS,
+                    help="Destination tool to migrate to.")
     ap.add_argument("--direction",
-                    choices=["claude-to-codex", "codex-to-claude"],
-                    help="Direction to migrate.")
+                    help="Backward-compat shorthand for --from/--to, e.g. "
+                    "'claude-to-codex' or 'cursor-to-claude'.")
     ap.add_argument("--restore", nargs="?", const="__latest__",
                     metavar="BACKUP_DIR",
                     help="Restore from a previous migration backup. Pass a "
                     "specific backup directory, or omit to use the latest "
-                    "one under ~/.claude/backups or ~/.codex/backups.")
+                    "one under any tool's backups dir.")
     ap.add_argument("--scope", choices=["user", "project", "both"],
                     default="user")
     ap.add_argument("--claude-dir")
     ap.add_argument("--codex-dir")
+    ap.add_argument("--cursor-dir")
     ap.add_argument("--dry-run", action="store_true")
     mg = ap.add_mutually_exclusive_group()
     mg.add_argument("--merge", dest="merge", action="store_true", default=True)
@@ -1494,10 +1876,26 @@ def main() -> int:
                     help="Comma-separated Tier B IDs to skip (or 'all').")
     args = ap.parse_args()
 
-    if not args.direction and args.restore is None:
-        ap.error("either --direction or --restore is required")
-    if args.direction and args.restore is not None:
-        ap.error("--direction and --restore are mutually exclusive")
+    # Resolve from/to from either --from/--to or legacy --direction.
+    if args.direction and (args.from_tool or args.to_tool):
+        ap.error("use --from/--to or --direction, not both")
+    if args.direction:
+        if "-to-" not in args.direction:
+            ap.error(f"invalid --direction: {args.direction!r}; "
+                     "expected e.g. 'claude-to-codex'")
+        f, _, t = args.direction.partition("-to-")
+        if f not in TOOLS or t not in TOOLS:
+            ap.error(f"unknown tool(s) in --direction: {args.direction!r}")
+        args.from_tool, args.to_tool = f, t
+
+    have_migrate = args.from_tool and args.to_tool
+    have_restore = args.restore is not None
+    if not have_migrate and not have_restore:
+        ap.error("either --from + --to, --direction, or --restore is required")
+    if have_migrate and have_restore:
+        ap.error("--from/--to and --restore are mutually exclusive")
+    if have_migrate and args.from_tool == args.to_tool:
+        ap.error("--from and --to must differ")
 
     interactive_default = not args.no_interactive and is_interactive()
 
@@ -1522,19 +1920,29 @@ def main() -> int:
     skip_set = _csv_set(args.skip_lossy)
     interactive = interactive_default and not (apply_set or skip_set)
 
-    direction_key = "c2x" if args.direction == "claude-to-codex" else "x2c"
-    pairs = _resolve_pairs(args)
+    from_tool, to_tool = args.from_tool, args.to_tool
+    direction_key = f"{from_tool}->{to_tool}"
 
-    for claude_dir, codex_dir, claude_doc, codex_doc in pairs:
-        if direction_key == "c2x":
-            src_root, dst_root = claude_dir, codex_dir
-            src_doc, dst_doc = claude_doc, codex_doc
-        else:
-            src_root, dst_root = codex_dir, claude_dir
-            src_doc, dst_doc = codex_doc, claude_doc
+    runner = RUNNERS.get((from_tool, to_tool))
+    if runner is None:
+        ap.error(f"unsupported direction: {direction_key}")
 
-        label = (f"{'Claude Code → Codex' if direction_key == 'c2x' else 'Codex → Claude Code'}"
-                 f"  ({src_root} → {dst_root})")
+    overrides = {
+        "claude": args.claude_dir,
+        "codex": args.codex_dir,
+        "cursor": args.cursor_dir,
+    }
+    scopes = ["user", "project"] if args.scope == "both" else [args.scope]
+
+    for scope in scopes:
+        src = _tool_paths(from_tool, scope, overrides[from_tool])
+        dst = _tool_paths(to_tool, scope, overrides[to_tool])
+        src_root, dst_root = src["root"], dst["root"]
+        src_doc, dst_doc = src["doc"], dst["doc"]
+
+        pretty = {"claude": "Claude Code", "codex": "Codex CLI", "cursor": "Cursor"}
+        label = (f"{pretty[from_tool]} → {pretty[to_tool]} "
+                 f"({src_root} → {dst_root})")
 
         if not src_root.exists() and not (src_doc and src_doc.exists()):
             print(f"\n--- {label}\n(no source files — skipped)")
@@ -1554,10 +1962,7 @@ def main() -> int:
         # back up the full set of files atomically (and show the user the
         # complete list of changes) before any writes happen.
         ctx.plan_mode = True
-        if direction_key == "c2x":
-            run_claude_to_codex(ctx, decisions)
-        else:
-            run_codex_to_claude(ctx, decisions)
+        runner(ctx, decisions)
         planned = sorted(ctx.planned_writes)
 
         print()
@@ -1596,10 +2001,7 @@ def main() -> int:
         ctx.plan_mode = False
         ctx.planned_writes.clear()
         print(f"--- Running: {label}")
-        if direction_key == "c2x":
-            run_claude_to_codex(ctx, decisions)
-        else:
-            run_codex_to_claude(ctx, decisions)
+        runner(ctx, decisions)
 
         # Step 5: write report.
         if not args.dry_run:

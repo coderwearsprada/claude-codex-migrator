@@ -460,5 +460,189 @@ class BackupAndRestoreTests(FsTestBase):
         self.assertFalse((self.dst / "fresh.json").exists())
 
 
+# ============================================================================
+# Cursor support
+# ============================================================================
+
+class CursorMcpTests(FsTestBase):
+    def test_read_mcp_json(self):
+        (self.src / "mcp.json").write_text(json.dumps({
+            "mcpServers": {"foo": {"command": "fooserver", "args": ["--x"]}}
+        }))
+        servers = m.cursor_read_mcp(self.src)
+        self.assertEqual(servers["foo"]["command"], "fooserver")
+
+    def test_write_mcp_merges_existing(self):
+        (self.dst / "mcp.json").write_text(json.dumps({
+            "mcpServers": {"keep": {"command": "k"}}
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.cursor_write_mcp({"new": {"command": "n"}}, self.dst, ctx)
+        data = json.loads((self.dst / "mcp.json").read_text())
+        self.assertEqual(set(data["mcpServers"].keys()), {"keep", "new"})
+
+
+class CursorRulesTests(FsTestBase):
+    def test_mdc_round_trip_preserves_globs_and_alwaysapply(self):
+        rules_dir = self.src / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "react.mdc").write_text(
+            "---\ndescription: React rules\nglobs: src/**/*.tsx\n"
+            "alwaysApply: false\n---\nUse hooks.\n")
+        (rules_dir / "general.mdc").write_text(
+            "---\ndescription: General\nalwaysApply: true\n---\nBe concise.\n")
+
+        rules = m.cursor_read_rules(self.src)
+        # Order: directory listing is sorted, so general before react.
+        names = sorted(r.name for r in rules)
+        self.assertEqual(names, ["general", "react"])
+
+        # Render to a fenced doc, parse back, write fresh rules — should
+        # reproduce the originals.
+        doc = m.cursor_rules_to_doc(rules)
+        parsed = m.doc_to_cursor_rules(doc)
+        # 2 fenced rules + possibly a default "migrated" if leftover text;
+        # there's no leftover in this case.
+        by_name = {r.name: r for r in parsed}
+        self.assertIn("react", by_name)
+        self.assertEqual(by_name["react"].globs, "src/**/*.tsx")
+        self.assertFalse(by_name["react"].always_apply)
+        self.assertEqual(by_name["general"].body, "Be concise.")
+        self.assertTrue(by_name["general"].always_apply)
+
+    def test_legacy_cursorrules_picked_up(self):
+        # Simulate <project_root>/.cursorrules next to a .cursor/ dir.
+        project_root = self.tmp / "proj"
+        project_root.mkdir()
+        cursor_root = project_root / ".cursor"
+        cursor_root.mkdir()
+        (project_root / ".cursorrules").write_text("Use 2-space indent.\n")
+
+        rules = m.cursor_read_rules(cursor_root)
+        self.assertEqual(len(rules), 1)
+        self.assertEqual(rules[0].name, "_cursorrules_legacy")
+        self.assertIn("2-space", rules[0].body)
+
+    def test_doc_with_leftover_becomes_default_rule(self):
+        text = ("# Top-level notes\nBe nice.\n\n" +
+                m.cursor_rules_to_doc([
+                    m.CursorRule(name="r1", description="", globs=None,
+                                 always_apply=True, body="rule one body")]))
+        rules = m.doc_to_cursor_rules(text, default_name="leftover")
+        names = {r.name for r in rules}
+        self.assertEqual(names, {"r1", "leftover"})
+        leftover = next(r for r in rules if r.name == "leftover")
+        self.assertIn("Be nice", leftover.body)
+
+
+class CursorToolPathsTests(unittest.TestCase):
+    def test_cursor_paths_user_scope(self):
+        p = m._tool_paths("cursor", "user", None)
+        self.assertEqual(p["root"], Path.home() / ".cursor")
+        self.assertIsNone(p["doc"])
+
+    def test_cursor_paths_project_scope(self):
+        p = m._tool_paths("cursor", "project", None)
+        self.assertEqual(p["root"], Path.cwd() / ".cursor")
+        self.assertEqual(p["doc"], Path.cwd() / ".cursorrules")
+
+    def test_override_dir_short_circuits_scope(self):
+        p = m._tool_paths("cursor", "user", "/tmp/somewhere")
+        self.assertEqual(p["root"], Path("/tmp/somewhere"))
+
+
+class CursorDirectionDriversTests(FsTestBase):
+    def test_claude_to_cursor_creates_rules_and_mcp(self):
+        (self.src / "settings.json").write_text(json.dumps({
+            "mcpServers": {"foo": {"command": "fooserver"}}
+        }))
+        (self.src / "CLAUDE.md").write_text("# Be concise\n")
+
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_cursor(ctx, {})
+
+        self.assertTrue((self.dst / "mcp.json").exists())
+        mdc = list((self.dst / "rules").glob("*.mdc"))
+        self.assertEqual(len(mdc), 1)
+        self.assertIn("Be concise", mdc[0].read_text())
+
+    def test_cursor_to_claude_round_trips_rules(self):
+        rules_dir = self.src / "rules"
+        rules_dir.mkdir()
+        (rules_dir / "r1.mdc").write_text(
+            "---\ndescription: R1\nglobs: src/**\nalwaysApply: false\n---\n"
+            "Rule one.\n")
+        (self.src / "mcp.json").write_text(json.dumps({
+            "mcpServers": {"foo": {"command": "fooserver"}}}))
+
+        ctx = make_ctx(self.src, self.dst)
+        m.run_cursor_to_claude(ctx, {})
+
+        text = (self.dst / "CLAUDE.md").read_text()
+        self.assertIn("migrator:begin kind=cursor-rule source=r1", text)
+        self.assertIn('globs="src/**"', text)
+        s = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(s["mcpServers"]["foo"]["type"], "stdio")
+
+    def test_cursor_to_codex_filters_non_stdio_mcp(self):
+        (self.src / "mcp.json").write_text(json.dumps({
+            "mcpServers": {
+                "ok":  {"command": "x"},
+                "bad": {"type": "sse", "url": "https://x"},
+            }
+        }))
+        ctx = make_ctx(self.src, self.dst)
+        m.run_cursor_to_codex(ctx, {})
+
+        cfg = tomllib.loads((self.dst / "config.toml").read_text())
+        self.assertIn("ok", cfg["mcp_servers"])
+        self.assertNotIn("bad", cfg["mcp_servers"])
+        self.assertTrue(any("sse" in s for s in ctx.report.skipped_unmappable))
+
+    def test_codex_to_cursor_translates_mcp_and_docs(self):
+        (self.src / "config.toml").write_text(
+            'model = "gpt-5"\n'
+            '[mcp_servers.foo]\ncommand = "fooserver"\n'
+        )
+        (self.src / "AGENTS.md").write_text("# Test rules\n")
+        ctx = make_ctx(self.src, self.dst)
+        m.run_codex_to_cursor(ctx, {})
+
+        data = json.loads((self.dst / "mcp.json").read_text())
+        self.assertEqual(data["mcpServers"]["foo"]["command"], "fooserver")
+        mdcs = list((self.dst / "rules").glob("*.mdc"))
+        self.assertEqual(len(mdcs), 1)
+
+
+class CursorFullRoundTripTests(FsTestBase):
+    def test_cursor_to_claude_to_cursor_preserves_rule_metadata(self):
+        # Original cursor rules with globs + alwaysApply.
+        c1 = self.tmp / "c1"
+        rules_c1 = c1 / "rules"
+        rules_c1.mkdir(parents=True)
+        (rules_c1 / "react.mdc").write_text(
+            "---\ndescription: React rules\nglobs: src/**/*.tsx\n"
+            "alwaysApply: false\n---\nUse hooks.\n")
+
+        # cursor → claude
+        cl = self.tmp / "claude"
+        cl.mkdir()
+        ctx1 = make_ctx(c1, cl)
+        m.run_cursor_to_claude(ctx1, {})
+
+        # claude → cursor (different dst dir to avoid the original)
+        c2 = self.tmp / "c2"
+        c2.mkdir()
+        ctx2 = make_ctx(cl, c2)
+        m.run_claude_to_cursor(ctx2, {})
+
+        # The react rule's frontmatter should round-trip byte-equivalent.
+        result = (c2 / "rules" / "react.mdc").read_text()
+        body, fm = m.strip_frontmatter(result)
+        self.assertEqual(fm.get("globs"), "src/**/*.tsx")
+        self.assertEqual(fm.get("alwaysApply"), "false")
+        self.assertEqual(body.strip(), "Use hooks.")
+
+
 if __name__ == "__main__":
     unittest.main()

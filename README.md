@@ -205,7 +205,7 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-56 tests, stdlib-only. They cover the TOML writer, frontmatter and
+61 tests, stdlib-only. They cover the TOML writer, frontmatter and
 fenced-block round-trips, MCP normalization for all three tools, every
 Tier A direction (claude↔codex, claude↔cursor, codex↔cursor), the
 slash-command `description`/`argument-hint` round-trip, MDC frontmatter

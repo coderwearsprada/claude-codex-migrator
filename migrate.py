@@ -3,7 +3,7 @@
 migrate.py — Migrate settings + custom configuration between Claude Code
 (~/.claude) and Codex CLI (~/.codex), in either direction.
 
-Requires Python 3.11+ (uses tomllib). No third-party dependencies.
+Requires Python 3.9+. No third-party dependencies.
 
 Usage:
     python3 migrate.py --direction claude-to-codex
@@ -48,6 +48,7 @@ import os
 import re
 import shutil
 import sys
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -330,7 +331,11 @@ def write_toml(data: dict, path: Path) -> None:
 # ============================================================================
 
 def ts() -> str:
-    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+
+
+def _unique_backup_root(dst_root: Path) -> Path:
+    return dst_root / "backups" / f"pre-migrate-{ts()}-{uuid.uuid4().hex[:8]}"
 
 
 def strip_frontmatter(text: str) -> tuple[str, dict | None]:
@@ -357,7 +362,7 @@ def meta_comment_to_frontmatter(text: str) -> tuple[str, dict | None]:
     m = MIGRATOR_META_RE.match(text)
     if not m:
         return text, None
-    attrs = dict(re.findall(r'(\w[\w-]*)="((?:[^"\\]|\\.)*)"', m.group("attrs")))
+    attrs = _parse_comment_meta(m.group("attrs"))
     return text[m.end():], (attrs or None)
 
 
@@ -365,8 +370,26 @@ def frontmatter_to_meta_comment(fm: dict) -> str:
     keep = {k: v for k, v in fm.items() if k in ("description", "argument-hint")}
     if not keep:
         return ""
-    parts = " ".join(f'{k}="{v}"' for k, v in keep.items())
-    return f"<!-- migrator:meta {parts} -->\n"
+    return f"<!-- migrator:meta json={json.dumps(keep, ensure_ascii=False)} -->\n"
+
+
+def _parse_comment_meta(raw: str) -> dict:
+    if raw.startswith("json="):
+        try:
+            data = json.loads(raw.removeprefix("json="))
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return dict(re.findall(r'(\w[\w-]*)="((?:[^"\\]|\\.)*)"', raw))
+
+
+def safe_cursor_rule_name(name: str, fallback: str = "migrated") -> str:
+    """Return a safe Cursor rule basename, never a path."""
+    stem = Path(str(name)).name
+    if stem.endswith(".mdc"):
+        stem = stem[:-4]
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip(".-")
+    return stem or fallback
 
 
 def make_frontmatter(d: dict) -> str:
@@ -457,7 +480,7 @@ class Ctx:
     backup_root: Path = field(init=False)
 
     def __post_init__(self) -> None:
-        self.backup_root = self.dst_root / "backups" / f"pre-migrate-{ts()}"
+        self.backup_root = _unique_backup_root(self.dst_root)
 
 
 def write_text(ctx: Ctx, path: Path, content: str) -> None:
@@ -917,16 +940,17 @@ def cursor_rules_to_doc(rules: list[CursorRule]) -> str:
     metadata so a reverse migration can split them back out."""
     parts: list[str] = []
     for r in rules:
-        meta_attrs: list[str] = []
+        meta_attrs: list[tuple[str, str]] = []
         if r.description:
-            meta_attrs.append(f'description="{r.description}"')
+            meta_attrs.append(("description", r.description))
         if r.globs is not None:
             g = r.globs if isinstance(r.globs, str) else ",".join(r.globs)
-            meta_attrs.append(f'globs="{g}"')
-        meta_attrs.append(f'alwaysApply="{str(r.always_apply).lower()}"')
+            meta_attrs.append(("globs", g))
+        meta_attrs.append(("alwaysApply", str(r.always_apply).lower()))
+        meta = {k: v for k, v in meta_attrs}
         parts.append(
-            f"<!-- migrator:begin kind=cursor-rule source={r.name} -->\n"
-            f"<!-- migrator:cursor-meta {' '.join(meta_attrs)} -->\n"
+            f"<!-- migrator:begin kind=cursor-rule source={safe_cursor_rule_name(r.name)} -->\n"
+            f"<!-- migrator:cursor-meta json={json.dumps(meta, ensure_ascii=False)} -->\n"
             f"{r.body}\n"
             f"<!-- migrator:end -->"
         )
@@ -941,13 +965,12 @@ def doc_to_cursor_rules(text: str, default_name: str = "migrated") -> list[Curso
     spans: list[tuple[int, int]] = []
     for m in CURSOR_RULE_BLOCK_RE.finditer(text):
         attrs_str = m.group("meta") or ""
-        attrs = dict(re.findall(
-            r'(\w[\w-]*)="((?:[^"\\]|\\.)*)"', attrs_str))
+        attrs = _parse_comment_meta(attrs_str)
         globs = attrs.get("globs")
         if globs and "," in globs:
             globs = [g.strip() for g in globs.split(",")]
         rules.append(CursorRule(
-            name=m.group("name"),
+            name=safe_cursor_rule_name(m.group("name")),
             description=attrs.get("description", ""),
             globs=globs,
             always_apply=attrs.get("alwaysApply", "false").lower() == "true",
@@ -970,7 +993,7 @@ def doc_to_cursor_rules(text: str, default_name: str = "migrated") -> list[Curso
     leftover = "\n\n".join(leftover_parts).strip()
     if leftover:
         rules.append(CursorRule(
-            name=default_name, description="Migrated content",
+            name=safe_cursor_rule_name(default_name), description="Migrated content",
             globs=None, always_apply=True, body=leftover,
         ))
     return rules
@@ -989,7 +1012,7 @@ def cursor_write_rules(rules: list[CursorRule], cursor_root: Path,
                            else ",".join(r.globs))
         fm["alwaysApply"] = str(r.always_apply).lower()
         body = make_frontmatter(fm) + r.body.rstrip() + "\n"
-        write_text(ctx, rules_dir / f"{r.name}.mdc", body)
+        write_text(ctx, rules_dir / f"{safe_cursor_rule_name(r.name)}.mdc", body)
 
 
 def _cursor_label_mcp(direction: str, mcp: dict) -> str:
@@ -2147,6 +2170,7 @@ def main() -> int:
         # complete list of changes) before any writes happen.
         ctx.plan_mode = True
         runner(ctx, decisions)
+        ctx.planned_writes.add(dst_root / "MIGRATION_REPORT.md")
         planned = sorted(ctx.planned_writes)
 
         print()

@@ -94,7 +94,7 @@ class FrontmatterTests(unittest.TestCase):
         self.assertEqual(body, "no frontmatter here\n")
 
     def test_meta_comment_roundtrip(self):
-        fm = {"description": "do a thing", "argument-hint": "<arg>"}
+        fm = {"description": 'do a "thing" \\ safely', "argument-hint": "<arg>"}
         text = m.frontmatter_to_meta_comment(fm) + "rest\n"
         rest, parsed = m.meta_comment_to_frontmatter(text)
         self.assertEqual(rest, "rest\n")
@@ -104,9 +104,10 @@ class FrontmatterTests(unittest.TestCase):
         # description + argument-hint round-trip; model + allowed-tools don't.
         fm = {"description": "d", "model": "opus", "allowed-tools": "Bash"}
         comment = m.frontmatter_to_meta_comment(fm)
-        self.assertIn('description="d"', comment)
-        self.assertNotIn("model=", comment)
-        self.assertNotIn("allowed-tools=", comment)
+        _, parsed = m.meta_comment_to_frontmatter(comment)
+        self.assertEqual(parsed, {"description": "d"})
+        self.assertNotIn("model", comment)
+        self.assertNotIn("allowed-tools", comment)
 
 
 class FencedBlockTests(unittest.TestCase):
@@ -268,7 +269,8 @@ class CommandsRoundTripTests(FsTestBase):
 
         # description rides along in the meta comment; model + allowed-tools do not.
         out = (self.dst / "prompts" / "foo.md").read_text()
-        self.assertIn('description="D"', out)
+        _, parsed = m.meta_comment_to_frontmatter(out)
+        self.assertEqual(parsed, {"description": "D"})
         self.assertNotIn("allowed-tools", out)
         self.assertTrue(any("model" in n and "allowed-tools" in n
                             for n in ctx.report.notes))
@@ -459,6 +461,24 @@ class BackupAndRestoreTests(FsTestBase):
                          '{"model": "original"}')
         self.assertFalse((self.dst / "fresh.json").exists())
 
+    def test_report_file_can_be_backed_up_and_restored(self):
+        (self.dst / "MIGRATION_REPORT.md").write_text("old report")
+        ctx = make_ctx(self.src, self.dst)
+        ctx.planned_writes = {self.dst / "MIGRATION_REPORT.md"}
+        backup_root = m.perform_backup(ctx)
+
+        (self.dst / "MIGRATION_REPORT.md").write_text("new report")
+        rc = m.restore_from_backup(backup_root, interactive=False, dry_run=False)
+
+        self.assertEqual(rc, 0)
+        self.assertEqual((self.dst / "MIGRATION_REPORT.md").read_text(),
+                         "old report")
+
+    def test_backup_roots_are_unique(self):
+        a = make_ctx(self.src, self.dst).backup_root
+        b = make_ctx(self.src, self.dst).backup_root
+        self.assertNotEqual(a, b)
+
 
 # ============================================================================
 # Cursor support
@@ -580,7 +600,7 @@ class CursorDirectionDriversTests(FsTestBase):
 
         text = (self.dst / "CLAUDE.md").read_text()
         self.assertIn("migrator:begin kind=cursor-rule source=r1", text)
-        self.assertIn('globs="src/**"', text)
+        self.assertIn('"globs": "src/**"', text)
         s = json.loads((self.dst / "settings.json").read_text())
         self.assertEqual(s["mcpServers"]["foo"]["type"], "stdio")
 
@@ -788,6 +808,41 @@ class CursorFullRoundTripTests(FsTestBase):
         self.assertEqual(fm.get("globs"), "src/**/*.tsx")
         self.assertEqual(fm.get("alwaysApply"), "false")
         self.assertEqual(body.strip(), "Use hooks.")
+
+    def test_cursor_metadata_roundtrip_preserves_quotes(self):
+        c1 = self.tmp / "c1"
+        rules_c1 = c1 / "rules"
+        rules_c1.mkdir(parents=True)
+        (rules_c1 / "quoted.mdc").write_text(
+            '---\ndescription: Use "strict" mode\\paths\n'
+            "alwaysApply: true\n---\nBody.\n")
+
+        cl = self.tmp / "claude"
+        cl.mkdir()
+        m.run_cursor_to_claude(make_ctx(c1, cl), {})
+
+        c2 = self.tmp / "c2"
+        c2.mkdir()
+        m.run_claude_to_cursor(make_ctx(cl, c2), {})
+
+        _, fm = m.strip_frontmatter((c2 / "rules" / "quoted.mdc").read_text())
+        self.assertEqual(fm.get("description"), 'Use "strict" mode\\paths')
+
+    def test_cursor_rule_source_cannot_escape_rules_dir(self):
+        cl = self.tmp / "claude"
+        cl.mkdir()
+        (cl / "CLAUDE.md").write_text(
+            "<!-- migrator:begin kind=cursor-rule source=../../outside -->\n"
+            "<!-- migrator:cursor-meta json={\"alwaysApply\":\"true\"} -->\n"
+            "Body.\n"
+            "<!-- migrator:end -->\n")
+
+        c2 = self.tmp / "cursor"
+        c2.mkdir()
+        m.run_claude_to_cursor(make_ctx(cl, c2), {})
+
+        self.assertTrue((c2 / "rules" / "outside.mdc").exists())
+        self.assertFalse((self.tmp / "outside.mdc").exists())
 
 
 if __name__ == "__main__":

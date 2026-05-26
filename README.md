@@ -215,4 +215,4 @@ cursor→claude→cursor metadata round-trip. Verified on Python 3.9 and 3.13.
 
 ## License
 
-MIT
+Apache License 2.0

@@ -1889,21 +1889,36 @@ RUNNERS: dict[tuple[str, str], Callable[[Ctx, dict[str, bool]], None]] = {
 # ============================================================================
 
 def find_latest_backup() -> Path | None:
-    bases = [
-        Path.home() / ".claude" / "backups",
-        Path.home() / ".codex" / "backups",
-        Path.cwd() / ".claude" / "backups",
-        Path.cwd() / ".codex" / "backups",
-    ]
-    candidates: list[Path] = []
+    """Return the most recently created migration backup across every
+    known tool's backups dir (user + project scope). Ranks by the
+    `created_at` field in the manifest, with mtime as a tiebreak, so the
+    correct "last migration" wins even when filesystems have coarse mtime
+    resolution or when backups have been copied around.
+    """
+    bases: list[Path] = []
+    for tool in TOOLS:
+        bases.append(Path.home() / f".{tool}" / "backups")
+        bases.append(Path.cwd() / f".{tool}" / "backups")
+
+    candidates: list[tuple[str, float, Path]] = []
     for b in bases:
-        if b.is_dir():
-            for p in b.glob("pre-migrate-*"):
-                if (p / "manifest.json").exists():
-                    candidates.append(p)
+        if not b.is_dir():
+            continue
+        for p in b.glob("pre-migrate-*"):
+            manifest = p / "manifest.json"
+            if not manifest.exists():
+                continue
+            created_at = ""
+            try:
+                created_at = json.loads(
+                    manifest.read_text(encoding="utf-8")
+                ).get("created_at", "")
+            except json.JSONDecodeError:
+                pass
+            candidates.append((created_at, p.stat().st_mtime, p))
     if not candidates:
         return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+    return max(candidates)[2]
 
 
 def restore_from_backup(backup_path: Path, interactive: bool,

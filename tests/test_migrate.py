@@ -722,6 +722,44 @@ class CursorTierBIntegrationTests(FsTestBase):
                          " ".join(ctx.report.skipped_unmappable))
 
 
+class FindLatestBackupTests(FsTestBase):
+    """find_latest_backup must consider every tool's backups dir, ordered
+    by the manifest's created_at, so consecutive migrations across
+    different tools restore the *most recent* one, not the first-seen."""
+
+    def _make_backup(self, root: Path, ts: str) -> Path:
+        b = root / "backups" / f"pre-migrate-{ts}"
+        b.mkdir(parents=True)
+        (b / "manifest.json").write_text(json.dumps({
+            "created_at": ts,
+            "direction": f"test-{ts}",
+            "src_root": str(root),
+            "dst_root": str(root),
+            "entries": [],
+        }))
+        return b
+
+    def test_latest_across_tools_wins(self):
+        # Pretend we have backups in all three tools' dirs. The cursor one
+        # is newest by created_at; it must be returned.
+        claude_dir = self.tmp / ".claude"
+        codex_dir = self.tmp / ".codex"
+        cursor_dir = self.tmp / ".cursor"
+        for d in (claude_dir, codex_dir, cursor_dir):
+            d.mkdir()
+
+        self._make_backup(claude_dir, "20260101-000000")
+        self._make_backup(codex_dir,  "20260102-000000")
+        latest_expected = self._make_backup(cursor_dir, "20260103-000000")
+
+        # Patch the search bases to point at our tmp tree.
+        import unittest.mock as mock
+        with mock.patch.object(m.Path, "home", return_value=self.tmp), \
+             mock.patch.object(m.Path, "cwd",  return_value=self.tmp):
+            got = m.find_latest_backup()
+        self.assertEqual(got, latest_expected)
+
+
 class CursorFullRoundTripTests(FsTestBase):
     def test_cursor_to_claude_to_cursor_preserves_rule_metadata(self):
         # Original cursor rules with globs + alwaysApply.

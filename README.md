@@ -105,9 +105,13 @@ Notes:
   (markdown) are different shapes for similar things, so they're embedded
   inside the target's instruction document as a `<!-- migrator:begin ... -->`
   fenced block that the reverse direction can unwrap.
-- Only **stdio** MCP servers transfer. Claude SSE/HTTP MCP servers are
-  flagged as unsupported in Codex.
-- Effort levels map: `max ↔ high`, `minimal → low`, others 1:1.
+- MCP server transports: **stdio** transfers everywhere. **SSE / HTTP**
+  MCP servers transfer between Claude Code and Cursor (both support them),
+  but are skipped going to Codex (stdio-only) with a report note.
+- Effort levels (Claude `effortLevel` ↔ Codex `model_reasoning_effort`)
+  map as `max ↔ high`, `minimal → low`, others 1:1. Cursor has no
+  equivalent reasoning-effort knob, so this field is reported but not
+  carried.
 
 ### Tier B — lossy, user-confirmed
 
@@ -124,6 +128,12 @@ accept or skip per-item (interactively, or via `--apply-lossy`/`--skip-lossy`).
 | `agents` | Claude `agents/*.md` → Codex `prompts/agent-*.md` (one-way) | Codex has no subagent runtime; each subagent file is flattened into a plain prompt with a header comment preserving the original frontmatter. |
 | `skills` | Claude `skills/*/SKILL.md` → Codex `prompts/skill-*.md` (one-way) | `SKILL.md` becomes a flat prompt; bundled assets are not migrated and auto-discovery is lost. |
 | `profiles` | Codex `[profiles.NAME]` → `~/.claude/profiles/NAME.settings.json` (one-way) | Claude has no profile runtime; each Codex profile is materialized as a standalone settings file you can copy over `settings.json` to activate. |
+
+All current Tier B options are claude↔codex pairs — Cursor directions
+don't have lossy heuristics today. Cursor-specific concepts that don't
+translate (rule globs going *out* are preserved via fenced metadata as a
+clean Tier A round-trip, not a Tier B heuristic) appear in Tier C below
+when they have no destination at all.
 
 ### Tier C — not translated
 
@@ -180,11 +190,13 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-Tests are stdlib-only. They cover the TOML writer, frontmatter and
-fenced-block round-trips, MCP normalization, both Tier A directions, the
-slash-command `description`/`argument-hint` round-trip, every Tier B
-heuristic, the plan-mode contract, and the backup-then-restore round-trip
-end to end.
+50 tests, stdlib-only. They cover the TOML writer, frontmatter and
+fenced-block round-trips, MCP normalization for all three tools, every
+Tier A direction (claude↔codex, claude↔cursor, codex↔cursor), the
+slash-command `description`/`argument-hint` round-trip, MDC frontmatter
++ legacy `.cursorrules` parsing, every Tier B heuristic, the plan-mode
+contract, the backup-then-restore round-trip, and a full
+cursor→claude→cursor metadata round-trip. Verified on Python 3.9 and 3.13.
 
 ## License
 

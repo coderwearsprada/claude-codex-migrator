@@ -1,4 +1,4 @@
-# claude-codex-migrator
+# code-agent-migrator
 
 A single-file Python script that migrates settings and custom configuration
 between [Claude Code](https://claude.com/claude-code) (`~/.claude`),

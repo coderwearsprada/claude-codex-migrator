@@ -115,30 +115,40 @@ Notes:
 
 ### Tier B — lossy, user-confirmed
 
-These don't have an exact equivalent on the other side. The preflight scan
-shows a one-line preview and rationale for each detected item and lets you
-accept or skip per-item (interactively, or via `--apply-lossy`/`--skip-lossy`).
+These don't have an exact equivalent on the destination side. The preflight
+scan shows a one-line preview and rationale for each detected item and
+lets you accept or skip per-item (interactively, or via
+`--apply-lossy`/`--skip-lossy`). Options are grouped below by **source tool**.
 
-| ID | Translation | Why lossy |
-|---|---|---|
-| `permissions` | Claude `permissions` → Codex `sandbox_mode` + `approval_policy` + `sandbox_workspace_write` | Per-tool regex patterns collapsed into coarse sandbox modes; `Write()` patterns become `writable_roots`; `WebFetch`/`WebSearch` deny becomes `network_access=false`. |
-| `sandbox` | Codex `sandbox_mode`/`approval_policy` → Claude `permissions.allow`/`deny` | Coarse modes expanded into Claude wildcard patterns. Round-trip is semantic, not byte-identical. |
-| `hooks` | Claude `hooks.Notification`/`Stop` → Codex `notify` | Only the notification-style hook events translate; `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`/`PreCompact` are Claude-only and get listed in the report. The shell command is wrapped as `["/bin/sh", "-c", ...]`. |
-| `notify` | Codex `notify` → Claude `hooks.Notification` | Single command with no matcher. |
-| `agents` | Claude `agents/*.md` → Codex `prompts/agent-*.md` (one-way) | Codex has no subagent runtime; each subagent file is flattened into a plain prompt with a header comment preserving the original frontmatter. |
-| `skills` | Claude `skills/*/SKILL.md` → Codex `prompts/skill-*.md` (one-way) | `SKILL.md` becomes a flat prompt; bundled assets are not migrated and auto-discovery is lost. |
-| `profiles` | Codex `[profiles.NAME]` → `~/.claude/profiles/NAME.settings.json` (one-way) | Claude has no profile runtime; each Codex profile is materialized as a standalone settings file you can copy over `settings.json` to activate. |
-| `agents_cursor` | Claude `agents/*.md` → `.cursor/rules/agent-*.mdc` (one-way) | Cursor has no subagent runtime. Each agent.md becomes an `alwaysApply:false` rule — content survives, subagent invocation semantics don't. |
-| `skills_cursor` | Claude `skills/*/SKILL.md` → `.cursor/rules/skill-*.mdc` (one-way) | Cursor has no skills runtime. `SKILL.md` becomes an `alwaysApply:false` rule; bundled assets are not migrated and auto-discovery is lost. |
-| `commands_cursor` | Claude `commands/*.md` → `.cursor/rules/command-*.mdc` (one-way) | Cursor has no slash-command equivalent. Commands become `alwaysApply:false` rules — content is loadable but won't be invokable as `/name`. |
-| `prompts_cursor` | Codex `prompts/*.md` → `.cursor/rules/prompt-*.mdc` (one-way) | Cursor has no on-demand prompt invocation. Codex prompts become `alwaysApply:false` rules — content is loadable but loses its on-demand semantics. |
+#### From Claude Code (`--from claude`)
 
-Note that cursor *→* claude/codex doesn't need any Tier B options: rules
-+ MCP are clean Tier A translations and rule frontmatter
-(`description`/`globs`/`alwaysApply`) round-trips via fenced metadata
+| Target | ID | Translation | Why lossy |
+|---|---|---|---|
+| Codex  | `permissions`     | `permissions.allow/deny` → `sandbox_mode` + `approval_policy` + `sandbox_workspace_write` | Per-tool regex patterns collapsed into coarse sandbox modes; `Write()` patterns become `writable_roots`; `WebFetch`/`WebSearch` deny becomes `network_access=false`. |
+| Codex  | `hooks`           | `hooks.Notification`/`Stop` → `notify` argv | Only those two hook events have a Codex equivalent. `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`/`PreCompact` are dropped. The shell command is wrapped as `["/bin/sh", "-c", ...]`. |
+| Codex  | `agents`          | `agents/*.md` → `prompts/agent-*.md` | Codex has no subagent runtime; each agent flattens to a plain prompt with a header comment preserving the original frontmatter. |
+| Codex  | `skills`          | `skills/*/SKILL.md` → `prompts/skill-*.md` | `SKILL.md` becomes a flat prompt; bundled assets are not migrated and skill auto-discovery is lost. |
+| Cursor | `agents_cursor`   | `agents/*.md` → `.cursor/rules/agent-*.mdc` | Cursor has no subagent runtime. Each agent becomes an `alwaysApply:false` rule — content survives, subagent invocation semantics don't. |
+| Cursor | `skills_cursor`   | `skills/*/SKILL.md` → `.cursor/rules/skill-*.mdc` | Cursor has no skills runtime. `SKILL.md` becomes an `alwaysApply:false` rule; bundled assets are not migrated and auto-discovery is lost. |
+| Cursor | `commands_cursor` | `commands/*.md` → `.cursor/rules/command-*.mdc` | Cursor has no slash-command equivalent. Commands become `alwaysApply:false` rules — loadable, but won't be invokable as `/name`. |
+
+#### From Codex CLI (`--from codex`)
+
+| Target | ID | Translation | Why lossy |
+|---|---|---|---|
+| Claude | `sandbox`         | `sandbox_mode`/`approval_policy` → `permissions.allow`/`deny` | Coarse modes expanded into Claude wildcard patterns. Round-trip is semantic, not byte-identical. |
+| Claude | `notify`          | `notify` argv → `hooks.Notification` | Becomes a single-command Claude hook with no matcher. |
+| Claude | `profiles`        | `[profiles.NAME]` → `~/.claude/profiles/NAME.settings.json` | Claude has no profile runtime; each profile is materialized as a standalone settings file you can copy over `settings.json` to activate. |
+| Cursor | `prompts_cursor`  | `prompts/*.md` → `.cursor/rules/prompt-*.mdc` | Cursor has no on-demand prompt invocation. Prompts become `alwaysApply:false` rules — loadable, but lose their on-demand semantics. |
+
+#### From Cursor (`--from cursor`)
+
+_None — cursor→claude and cursor→codex are clean Tier A only._ Rules and
+MCP servers translate verbatim, and rule frontmatter
+(`description`/`globs`/`alwaysApply`) round-trips through fenced metadata
 inside `CLAUDE.md`/`AGENTS.md`. The lossy direction is only when going
-*to* Cursor with content (subagents, skills, slash commands) Cursor has
-no runtime for.
+*to* Cursor (subagents, skills, slash commands, on-demand prompts) since
+Cursor has no runtime for those source concepts.
 
 ### Tier C — not translated
 

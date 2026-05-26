@@ -56,7 +56,7 @@ python3 migrate.py --restore /path/to/backups/pre-migrate-YYYYMMDD-HHMMSS
 | `--merge` / `--overwrite` | Merge into existing destination files where sensible (default), or replace outright. Backups happen either way. |
 | `--no-backup` | Skip the upfront backup (and disable `--restore` for this run). Not recommended. |
 | `--no-interactive` | Don't prompt for Tier B confirmations; combine with `--apply-lossy`/`--skip-lossy`. |
-| `--apply-lossy=IDS` / `--skip-lossy=IDS` | Comma-separated Tier B option IDs (or `all`). IDs: `permissions`, `sandbox`, `hooks`, `notify`, `agents`, `skills`, `profiles`. |
+| `--apply-lossy=IDS` / `--skip-lossy=IDS` | Comma-separated Tier B option IDs (or `all`). IDs: `permissions`, `sandbox`, `hooks`, `notify`, `agents`, `skills`, `profiles`, `agents_cursor`, `skills_cursor`, `commands_cursor`, `prompts_cursor`. |
 
 After each run the script writes `MIGRATION_REPORT.md` at the destination,
 split into: migrated cleanly (Tier A), migrated with loss (Tier B, user-
@@ -128,19 +128,24 @@ accept or skip per-item (interactively, or via `--apply-lossy`/`--skip-lossy`).
 | `agents` | Claude `agents/*.md` → Codex `prompts/agent-*.md` (one-way) | Codex has no subagent runtime; each subagent file is flattened into a plain prompt with a header comment preserving the original frontmatter. |
 | `skills` | Claude `skills/*/SKILL.md` → Codex `prompts/skill-*.md` (one-way) | `SKILL.md` becomes a flat prompt; bundled assets are not migrated and auto-discovery is lost. |
 | `profiles` | Codex `[profiles.NAME]` → `~/.claude/profiles/NAME.settings.json` (one-way) | Claude has no profile runtime; each Codex profile is materialized as a standalone settings file you can copy over `settings.json` to activate. |
+| `agents_cursor` | Claude `agents/*.md` → `.cursor/rules/agent-*.mdc` (one-way) | Cursor has no subagent runtime. Each agent.md becomes an `alwaysApply:false` rule — content survives, subagent invocation semantics don't. |
+| `skills_cursor` | Claude `skills/*/SKILL.md` → `.cursor/rules/skill-*.mdc` (one-way) | Cursor has no skills runtime. `SKILL.md` becomes an `alwaysApply:false` rule; bundled assets are not migrated and auto-discovery is lost. |
+| `commands_cursor` | Claude `commands/*.md` → `.cursor/rules/command-*.mdc` (one-way) | Cursor has no slash-command equivalent. Commands become `alwaysApply:false` rules — content is loadable but won't be invokable as `/name`. |
+| `prompts_cursor` | Codex `prompts/*.md` → `.cursor/rules/prompt-*.mdc` (one-way) | Cursor has no on-demand prompt invocation. Codex prompts become `alwaysApply:false` rules — content is loadable but loses its on-demand semantics. |
 
-All current Tier B options are claude↔codex pairs — Cursor directions
-don't have lossy heuristics today. Cursor-specific concepts that don't
-translate (rule globs going *out* are preserved via fenced metadata as a
-clean Tier A round-trip, not a Tier B heuristic) appear in Tier C below
-when they have no destination at all.
+Note that cursor *→* claude/codex doesn't need any Tier B options: rules
++ MCP are clean Tier A translations and rule frontmatter
+(`description`/`globs`/`alwaysApply`) round-trips via fenced metadata
+inside `CLAUDE.md`/`AGENTS.md`. The lossy direction is only when going
+*to* Cursor with content (subagents, skills, slash commands) Cursor has
+no runtime for.
 
 ### Tier C — not translated
 
 Listed in `MIGRATION_REPORT.md` so you know to recreate them by hand:
 
-- **Claude-only:** `statusLine`, `plugins/`, theme, slash-command `model`/`allowed-tools` frontmatter, and the hook event types listed above. When migrating to Cursor, also: `hooks`, `permissions`, `agents/`, `skills/`, `commands/`, `outputStyle`.
-- **Codex-only:** `model_provider(s)`, `tools.web_search`, `disable_response_storage` / history persistence, `tui` settings, `hide_agent_reasoning`, `project_doc_max_bytes`. When migrating to Cursor, also: `approval_policy`, `sandbox_mode`, `sandbox_workspace_write`, `shell_environment_policy`, `profiles`, `model_reasoning_effort`, `notify`.
+- **Claude-only:** `statusLine`, `plugins/`, theme, slash-command `model`/`allowed-tools` frontmatter, and the hook event types listed above. When migrating to Cursor, also: `hooks`, `permissions`, `outputStyle` (agents/skills/commands have Tier B options).
+- **Codex-only:** `model_provider(s)`, `tools.web_search`, `disable_response_storage` / history persistence, `tui` settings, `hide_agent_reasoning`, `project_doc_max_bytes`. When migrating to Cursor, also: `approval_policy`, `sandbox_mode`, `sandbox_workspace_write`, `shell_environment_policy`, `profiles`, `model_reasoning_effort`, `notify` (Codex prompts have a Tier B option).
 - **Cursor-only:** Cursor IDE settings (`User/settings.json`), keybindings, extensions list, notepads, composer history — all out of scope (IDE config, not agent config). Cursor MCP entries with `type: "sse"` or HTTP URLs are kept verbatim into Claude, but skipped going to Codex (which only supports stdio).
 
 ## What is never touched
@@ -190,7 +195,7 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-50 tests, stdlib-only. They cover the TOML writer, frontmatter and
+56 tests, stdlib-only. They cover the TOML writer, frontmatter and
 fenced-block round-trips, MCP normalization for all three tools, every
 Tier A direction (claude↔codex, claude↔cursor, codex↔cursor), the
 slash-command `description`/`argument-hint` round-trip, MDC frontmatter

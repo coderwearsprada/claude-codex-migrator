@@ -614,6 +614,114 @@ class CursorDirectionDriversTests(FsTestBase):
         self.assertEqual(len(mdcs), 1)
 
 
+class TierBCursorFlatteningTests(FsTestBase):
+    """The four cursor-bound Tier B options: claude agents/skills/commands
+    and codex prompts → cursor rules with alwaysApply:false."""
+
+    def test_agents_become_alwaysapply_false_rules(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "reviewer.md").write_text(
+            "---\ndescription: Code reviewer\n---\nReview carefully.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_agents_cursor(ctx)
+
+        out = (self.dst / "rules" / "agent-reviewer.mdc").read_text()
+        body, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm.get("description"), "Code reviewer")
+        self.assertEqual(fm.get("alwaysApply"), "false")
+        self.assertIn("Review carefully", body)
+
+    def test_skills_flattened_with_asset_note(self):
+        sk = self.src / "skills" / "demo"
+        sk.mkdir(parents=True)
+        (sk / "SKILL.md").write_text(
+            "---\nname: demo\n---\nSkill body.\n")
+        (sk / "asset.txt").write_text("bytes")
+
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_skills_cursor(ctx)
+
+        out = (self.dst / "rules" / "skill-demo.mdc").read_text()
+        self.assertIn("alwaysApply: false", out)
+        self.assertIn("1 asset file(s)", out)
+        self.assertIn("Skill body", out)
+        self.assertTrue(any("1 asset" in s
+                            for s in ctx.report.migrated_lossy))
+
+    def test_commands_become_invokable_style_rules(self):
+        cmds = self.src / "commands"
+        cmds.mkdir()
+        (cmds / "foo.md").write_text(
+            "---\ndescription: Do foo\n---\nFoo body.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_commands_cursor(ctx)
+
+        out = (self.dst / "rules" / "command-foo.mdc").read_text()
+        body, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm.get("description"), "Do foo")
+        self.assertEqual(fm.get("alwaysApply"), "false")
+        self.assertIn("Foo body", body)
+
+    def test_codex_prompts_become_cursor_rules(self):
+        prompts = self.src / "prompts"
+        prompts.mkdir()
+        (prompts / "summarize.md").write_text("Summarize this.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_codex_prompts_cursor(ctx)
+
+        out = (self.dst / "rules" / "prompt-summarize.mdc").read_text()
+        _, fm = m.strip_frontmatter(out)
+        # No source description → falls back to "Codex prompt: summarize"
+        self.assertIn("summarize", fm["description"].lower())
+        self.assertEqual(fm["alwaysApply"], "false")
+
+
+class CursorTierBIntegrationTests(FsTestBase):
+    """End-to-end: a claude→cursor run with agents/skills/commands present.
+    Agents/skills/commands should appear under migrated_lossy (when
+    accepted) and not also appear under skipped_unmappable as Tier C."""
+
+    def test_accepted_tier_b_doesnt_double_count_as_tier_c(self):
+        (self.src / "settings.json").write_text("{}")
+        for sub in ("agents", "skills/sk1", "commands"):
+            (self.src / sub).mkdir(parents=True)
+        (self.src / "agents" / "a.md").write_text("agent body")
+        (self.src / "skills" / "sk1" / "SKILL.md").write_text("skill body")
+        (self.src / "commands" / "c.md").write_text("cmd body")
+
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_cursor(ctx, lossy_decisions={
+            "agents_cursor": True,
+            "skills_cursor": True,
+            "commands_cursor": True,
+        })
+
+        # Lossy entries present.
+        joined = " ".join(ctx.report.migrated_lossy)
+        self.assertIn("agents/a.md", joined)
+        self.assertIn("skills/sk1/", joined)
+        self.assertIn("commands/c.md", joined)
+
+        # And NOT reported as "no equivalent" under unmappable.
+        unmappable = " ".join(ctx.report.skipped_unmappable)
+        self.assertNotIn("agents/", unmappable)
+        self.assertNotIn("skills/", unmappable)
+        self.assertNotIn("commands/", unmappable)
+
+    def test_declined_tier_b_appears_under_skipped_by_user(self):
+        (self.src / "agents").mkdir()
+        (self.src / "agents" / "r.md").write_text("x")
+        ctx = make_ctx(self.src, self.dst)
+        m.run_claude_to_cursor(ctx, lossy_decisions={"agents_cursor": False})
+
+        joined = " ".join(ctx.report.skipped_by_user)
+        self.assertIn("agents/ → .cursor/rules/agent-*.mdc", joined)
+        # Still not double-counted as unmappable.
+        self.assertNotIn("agents/",
+                         " ".join(ctx.report.skipped_unmappable))
+
+
 class CursorFullRoundTripTests(FsTestBase):
     def test_cursor_to_claude_to_cursor_preserves_rule_metadata(self):
         # Original cursor rules with globs + alwaysApply.

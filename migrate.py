@@ -1040,17 +1040,18 @@ def run_claude_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
         cursor_write_mcp(out, ctx.dst_root, ctx)
         ctx.report.migrated_clean.append(_cursor_label_mcp("→ cursor mcp.json", out))
 
-    # Things Cursor has no equivalent for: hooks, permissions, agents,
-    # skills, statusLine, outputStyle, slash commands, plugins.
+    # Settings keys with no Cursor equivalent (truly Tier C).
     for key in ("hooks", "permissions", "statusLine", "outputStyle"):
         if settings.get(key):
             ctx.report.skipped_unmappable.append(
                 f"settings.json:{key} (Cursor has no equivalent)")
-    for sub in ("agents", "skills", "commands", "plugins"):
-        p = ctx.src_root / sub
-        if p.is_dir() and any(p.iterdir()):
-            ctx.report.skipped_unmappable.append(
-                f"{sub}/ (Cursor has no equivalent)")
+    # `plugins/` is the only source dir with no Tier B option — agents,
+    # skills, and commands are handled by their cursor-bound Tier B
+    # options below.
+    plugins_dir = ctx.src_root / "plugins"
+    if plugins_dir.is_dir() and any(plugins_dir.iterdir()):
+        ctx.report.skipped_unmappable.append(
+            "plugins/ (Cursor has no equivalent)")
 
     # Tier B options applicable in this direction.
     _run_lossy(ctx, lossy_decisions, "claude->cursor")
@@ -1510,6 +1511,130 @@ def _apply_codex_profiles(ctx: Ctx) -> None:
         _ = sub_report  # unused but kept to mirror structure
 
 
+# ---- B6/7/8/9: claude/codex subagents, skills, commands, prompts → cursor rules ----
+# Cursor has no subagent runtime, no skills system, and no slash-command
+# concept. The next best thing is a Cursor rule (`.cursor/rules/*.mdc`)
+# with `alwaysApply: false` so the content is loadable when relevant but
+# not auto-prepended. The result is lossy in the same way as
+# agents→codex prompts: the invocation/runtime semantics don't survive,
+# only the text content does.
+
+def _flatten_dir_to_cursor_rules(ctx: Ctx, src_subdir: str, name_prefix: str,
+                                  fallback_desc_tpl: str, lossy_note: str,
+                                  always_apply: bool = False) -> None:
+    """Shared body for the four 'flatten claude/codex source dir into Cursor
+    rules' lossy options. Writes one `<prefix>-<name>.mdc` per source file
+    under `<dst_root>/rules/`."""
+    src_dir = ctx.src_root / src_subdir
+    rules_dir = ctx.dst_root / "rules"
+    for f in sorted(src_dir.rglob("*.md")):
+        rel = f.relative_to(src_dir)
+        stem = rel.as_posix().replace("/", "-").rsplit(".", 1)[0]
+        out_name = f"{name_prefix}-{stem}.mdc"
+        body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+        desc = (fm or {}).get("description") or fallback_desc_tpl.format(name=stem)
+        front_fm = {"description": desc, "alwaysApply": str(always_apply).lower()}
+        write_text(ctx, rules_dir / out_name,
+                   make_frontmatter(front_fm) + body.lstrip("\n"))
+        ctx.report.migrated_lossy.append(
+            f"{src_subdir}/{rel} → rules/{out_name} ({lossy_note})")
+
+
+# ---- agents → cursor rules ----
+def _detect_claude_agents_cursor(ctx: Ctx) -> bool:
+    p = ctx.src_root / "agents"
+    return p.is_dir() and any(p.rglob("*.md"))
+
+
+def _preview_claude_agents_cursor(ctx: Ctx) -> str:
+    n = sum(1 for _ in (ctx.src_root / "agents").rglob("*.md"))
+    return (f"{n} subagent file(s) → .cursor/rules/agent-*.mdc "
+            "(alwaysApply:false; loses subagent runtime)")
+
+
+def _apply_claude_agents_cursor(ctx: Ctx) -> None:
+    _flatten_dir_to_cursor_rules(
+        ctx, src_subdir="agents", name_prefix="agent",
+        fallback_desc_tpl="Migrated from Claude subagent {name}",
+        lossy_note="lossy: no subagent runtime in Cursor",
+    )
+
+
+# ---- skills → cursor rules ----
+def _detect_claude_skills_cursor(ctx: Ctx) -> bool:
+    p = ctx.src_root / "skills"
+    return p.is_dir() and any(p.glob("*/SKILL.md"))
+
+
+def _preview_claude_skills_cursor(ctx: Ctx) -> str:
+    n = sum(1 for _ in (ctx.src_root / "skills").glob("*/SKILL.md"))
+    return (f"{n} skill(s) → .cursor/rules/skill-*.mdc "
+            "(alwaysApply:false; bundled assets are not migrated)")
+
+
+def _apply_claude_skills_cursor(ctx: Ctx) -> None:
+    src_dir = ctx.src_root / "skills"
+    rules_dir = ctx.dst_root / "rules"
+    for skill_md in sorted(src_dir.glob("*/SKILL.md")):
+        name = skill_md.parent.name
+        body, fm = strip_frontmatter(skill_md.read_text(encoding="utf-8"))
+        desc = (fm or {}).get("description") or f"Migrated from Claude skill {name}"
+        front = make_frontmatter({"description": desc, "alwaysApply": "false"})
+        # Note bundled assets so the user knows what isn't migrated.
+        assets = [p for p in skill_md.parent.rglob("*")
+                  if p.is_file() and p.name != "SKILL.md"]
+        prelude = ""
+        if assets:
+            prelude = (f"<!-- Original skill bundled {len(assets)} asset "
+                       f"file(s); not migrated. -->\n\n")
+        write_text(ctx, rules_dir / f"skill-{name}.mdc",
+                   front + prelude + body.lstrip("\n"))
+        ctx.report.migrated_lossy.append(
+            f"skills/{name}/ → rules/skill-{name}.mdc "
+            f"(lossy: no skills runtime in Cursor; "
+            f"{len(assets)} asset file(s) not migrated)")
+
+
+# ---- claude commands → cursor rules ----
+def _detect_claude_commands_cursor(ctx: Ctx) -> bool:
+    p = ctx.src_root / "commands"
+    return p.is_dir() and any(p.rglob("*.md"))
+
+
+def _preview_claude_commands_cursor(ctx: Ctx) -> str:
+    n = sum(1 for _ in (ctx.src_root / "commands").rglob("*.md"))
+    return (f"{n} slash command(s) → .cursor/rules/command-*.mdc "
+            "(alwaysApply:false; not invocable like Claude slash commands)")
+
+
+def _apply_claude_commands_cursor(ctx: Ctx) -> None:
+    _flatten_dir_to_cursor_rules(
+        ctx, src_subdir="commands", name_prefix="command",
+        fallback_desc_tpl="Slash command: /{name}",
+        lossy_note="lossy: Cursor rules aren't invocable like /commands",
+    )
+
+
+# ---- codex prompts → cursor rules ----
+def _detect_codex_prompts_cursor(ctx: Ctx) -> bool:
+    p = ctx.src_root / "prompts"
+    return p.is_dir() and any(p.rglob("*.md"))
+
+
+def _preview_codex_prompts_cursor(ctx: Ctx) -> str:
+    n = sum(1 for _ in (ctx.src_root / "prompts").rglob("*.md"))
+    return (f"{n} prompt(s) → .cursor/rules/prompt-*.mdc "
+            "(alwaysApply:false; not on-demand invocable like Codex prompts)")
+
+
+def _apply_codex_prompts_cursor(ctx: Ctx) -> None:
+    _flatten_dir_to_cursor_rules(
+        ctx, src_subdir="prompts", name_prefix="prompt",
+        fallback_desc_tpl="Codex prompt: {name}",
+        lossy_note="lossy: Cursor rules aren't on-demand invocable",
+    )
+
+
 # ---- Catalog ---------------------------------------------------------------
 
 TIER_B: list[LossyOption] = [
@@ -1583,6 +1708,50 @@ TIER_B: list[LossyOption] = [
         detect=_detect_codex_profiles,
         preview=_preview_codex_profiles,
         apply=_apply_codex_profiles,
+    ),
+    LossyOption(
+        id="agents_cursor",
+        direction="claude->cursor",
+        label="agents/ → .cursor/rules/agent-*.mdc",
+        rationale=("Cursor has no subagent runtime. Each agent.md becomes a "
+                   "Cursor rule with alwaysApply:false — content survives, "
+                   "but subagent invocation semantics don't."),
+        detect=_detect_claude_agents_cursor,
+        preview=_preview_claude_agents_cursor,
+        apply=_apply_claude_agents_cursor,
+    ),
+    LossyOption(
+        id="skills_cursor",
+        direction="claude->cursor",
+        label="skills/ → .cursor/rules/skill-*.mdc",
+        rationale=("Cursor has no skills runtime. SKILL.md becomes a Cursor "
+                   "rule with alwaysApply:false; bundled assets are not "
+                   "migrated and auto-discovery is lost."),
+        detect=_detect_claude_skills_cursor,
+        preview=_preview_claude_skills_cursor,
+        apply=_apply_claude_skills_cursor,
+    ),
+    LossyOption(
+        id="commands_cursor",
+        direction="claude->cursor",
+        label="commands/ → .cursor/rules/command-*.mdc",
+        rationale=("Cursor has no slash-command equivalent. Commands become "
+                   "alwaysApply:false rules — content is loadable but won't "
+                   "be invokable as /commandname."),
+        detect=_detect_claude_commands_cursor,
+        preview=_preview_claude_commands_cursor,
+        apply=_apply_claude_commands_cursor,
+    ),
+    LossyOption(
+        id="prompts_cursor",
+        direction="codex->cursor",
+        label="prompts/ → .cursor/rules/prompt-*.mdc",
+        rationale=("Cursor has no on-demand prompt invocation. Codex prompts "
+                   "become alwaysApply:false rules — content is loadable but "
+                   "loses its on-demand semantics."),
+        detect=_detect_codex_prompts_cursor,
+        preview=_preview_codex_prompts_cursor,
+        apply=_apply_codex_prompts_cursor,
     ),
 ]
 

@@ -25,9 +25,6 @@ python3 migrate.py --from claude --to codex
 python3 migrate.py --from cursor --to claude
 python3 migrate.py --from codex  --to cursor
 
-# Legacy --direction is still accepted as a shorthand
-python3 migrate.py --direction claude-to-codex
-
 # Project-level instead of user-level (also accepts --scope both)
 python3 migrate.py --from claude --to cursor --scope project
 
@@ -48,7 +45,6 @@ python3 migrate.py --restore /path/to/backups/pre-migrate-YYYYMMDD-HHMMSS
 | Flag | Meaning |
 |---|---|
 | `--from {claude,codex,cursor}` / `--to {claude,codex,cursor}` | Source and destination tools. Required unless `--restore` is given. |
-| `--direction VALUE` | Backward-compat shorthand for `--from`/`--to`, e.g. `claude-to-codex` or `cursor-to-claude`. |
 | `--restore [BACKUP_DIR]` | Reverse a previous migration. Omit to use the latest backup found under any tool's backups dir. |
 | `--scope {user,project,both}` | Which config scope(s) to migrate (default: `user`). |
 | `--claude-dir PATH` / `--codex-dir PATH` / `--cursor-dir PATH` | Explicit config dirs; overrides `--scope`. |
@@ -73,27 +69,27 @@ confirmed), skipped by user choice, and not translated (no equivalent).
 | `CLAUDE.md`                            | `AGENTS.md`                                |
 | `commands/*.md`                        | `prompts/*.md`                             |
 | `settings.json:model`                  | `config.toml:model`                        |
-| `settings.json:mcpServers` (stdio)     | `config.toml:[mcp_servers.*]`              |
+| `.mcp.json` / `~/.claude.json`: `mcpServers` (stdio) | `config.toml:[mcp_servers.*]` |
 | `settings.json:env`                    | `config.toml:[shell_environment_policy] set` |
 | `settings.json:effortLevel`            | `config.toml:model_reasoning_effort`       |
 | `outputStyle` file contents *(c→x only)*  | fenced block inside `AGENTS.md`         |
+| `CLAUDE.md` imports `AGENTS.md` *(project x→c)* | `AGENTS.md`                    |
 | fenced block inside `CLAUDE.md` *(x→c only)* | `config.toml:instructions`           |
 
 **Cursor ↔ Claude / Codex**
 
 | Cursor                                 | Claude Code              | Codex CLI                   |
 |----------------------------------------|--------------------------|-----------------------------|
-| `<root>/mcp.json:mcpServers`           | `settings.json:mcpServers` | `config.toml:[mcp_servers.*]` |
-| `.cursor/rules/*.mdc` + `.cursorrules` | `CLAUDE.md`              | `AGENTS.md`                 |
+| `<root>/mcp.json:mcpServers`           | `.mcp.json` / `~/.claude.json`: `mcpServers` | `config.toml:[mcp_servers.*]` |
+| `.cursor/rules/*.mdc` + `.cursorrules` | `.claude/rules/*.md`     | `AGENTS.md`                 |
 
 Cursor user scope (`~/.cursor`) only has global MCP — Cursor has no
 user-level rules file. Project-scope rules go to/from `<project>/.cursor/`.
 The legacy `.cursorrules` (plain markdown at project root) is read on the
 way out and re-emitted as a single `.cursor/rules/_cursorrules_legacy.mdc`
-on the way in. Rule frontmatter (`description`, `globs`, `alwaysApply`)
-rides along in a fenced HTML-comment block inside `CLAUDE.md`/`AGENTS.md`
-so cursor→claude→cursor (or cursor→codex→cursor) round-trips preserve it
-verbatim.
+on the way in. Cursor rule frontmatter maps to native Claude rule
+frontmatter (`globs` → `paths`), with a small migrator metadata comment for
+Cursor-only fields such as `alwaysApply`.
 
 Notes:
 
@@ -126,7 +122,7 @@ lets you accept or skip per-item (interactively, or via
 |---|---|---|---|
 | Codex  | `permissions`     | `permissions.allow/deny` → `sandbox_mode` + `approval_policy` + `sandbox_workspace_write` | Per-tool regex patterns collapsed into coarse sandbox modes; `Write()` patterns become `writable_roots`; `WebFetch`/`WebSearch` deny becomes `network_access=false`. |
 | Codex  | `hooks`           | `hooks.Notification`/`Stop` → `notify` argv | Only those two hook events have a Codex equivalent. `PreToolUse`/`PostToolUse`/`UserPromptSubmit`/`SessionStart`/`SessionEnd`/`PreCompact` are dropped. The shell command is wrapped as `["/bin/sh", "-c", ...]`. |
-| Codex  | `agents`          | `agents/*.md` → `prompts/agent-*.md` | Codex has no subagent runtime; each agent flattens to a plain prompt with a header comment preserving the original frontmatter. |
+| Codex  | `agents`          | `agents/*.md` → `.codex/agents/*.toml` | Claude subagents become Codex custom agents. `name`, `description`, `model`, `effort`, and selected `permissionMode` values map to TOML; skills/tool lists become prompt guidance for review. |
 | Codex  | `skills`          | `skills/*/SKILL.md` → `prompts/skill-*.md` | `SKILL.md` becomes a flat prompt; bundled assets are not migrated and skill auto-discovery is lost. |
 | Cursor | `agents_cursor`   | `agents/*.md` → `.cursor/rules/agent-*.mdc` | Cursor has no subagent runtime. Each agent becomes an `alwaysApply:false` rule — content survives, subagent invocation semantics don't. |
 | Cursor | `skills_cursor`   | `skills/*/SKILL.md` → `.cursor/rules/skill-*.mdc` | Cursor has no skills runtime. `SKILL.md` becomes an `alwaysApply:false` rule; bundled assets are not migrated and auto-discovery is lost. |
@@ -145,10 +141,11 @@ lets you accept or skip per-item (interactively, or via
 
 _None — cursor→claude and cursor→codex are clean Tier A only._ Rules and
 MCP servers translate verbatim, and rule frontmatter
-(`description`/`globs`/`alwaysApply`) round-trips through fenced metadata
-inside `CLAUDE.md`/`AGENTS.md`. The lossy direction is only when going
-*to* Cursor (subagents, skills, slash commands, on-demand prompts) since
-Cursor has no runtime for those source concepts.
+(`description`/`globs`/`alwaysApply`) round-trips through native Claude
+rules plus a migrator metadata comment, or through fenced metadata in
+`AGENTS.md` for Codex. The lossy direction is only when going *to* Cursor
+(subagents, skills, slash commands, on-demand prompts) since Cursor has no
+runtime for those source concepts.
 
 ### Tier C — not translated
 
@@ -205,7 +202,7 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-61 tests, stdlib-only. They cover the TOML writer, frontmatter and
+65 tests, stdlib-only. They cover the TOML writer, frontmatter and
 fenced-block round-trips, MCP normalization for all three tools, every
 Tier A direction (claude↔codex, claude↔cursor, codex↔cursor), the
 slash-command `description`/`argument-hint` round-trip, MDC frontmatter

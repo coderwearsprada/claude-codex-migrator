@@ -6,8 +6,8 @@ migrate.py — Migrate settings + custom configuration between Claude Code
 Requires Python 3.9+. No third-party dependencies.
 
 Usage:
-    python3 migrate.py --direction claude-to-codex
-    python3 migrate.py --direction codex-to-claude
+    python3 migrate.py --from claude --to codex
+    python3 migrate.py --from codex --to claude
     python3 migrate.py --restore [BACKUP_DIR]      # revert a previous run
     # See --help for full options.
 
@@ -392,6 +392,72 @@ def safe_cursor_rule_name(name: str, fallback: str = "migrated") -> str:
     return stem or fallback
 
 
+def safe_agent_name(name: str, fallback: str = "agent") -> str:
+    stem = re.sub(r"[^A-Za-z0-9_-]+", "-", str(name)).strip("-_")
+    return stem or fallback
+
+
+def _csv_values(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, list):
+        return tuple(str(x).strip() for x in value if str(x).strip())
+    return tuple(x.strip() for x in str(value).split(",") if x.strip())
+
+
+def _first_heading(text: str) -> str | None:
+    for line in text.splitlines():
+        m = re.match(r"\s*#\s+(.+?)\s*$", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _claude_permission_to_codex_sandbox(mode: str | None) -> str | None:
+    if not mode:
+        return None
+    return {
+        "readOnly": "read-only",
+        "acceptEdits": "workspace-write",
+    }.get(mode)
+
+
+def _codex_effort_to_claude(effort: str | None) -> str | None:
+    if not effort:
+        return None
+    return {"minimal": "low", "xhigh": "max"}.get(effort, effort)
+
+
+_UNSET = object()
+
+
+def claude_project_root(ctx: Ctx, root: Path | None = None,
+                        doc: object = _UNSET) -> Path | None:
+    root = root or ctx.dst_root
+    doc = ctx.dst_doc if doc is _UNSET else doc
+    if root.name == ".claude" and doc is not None:
+        return root.parent
+    return None
+
+
+def claude_mcp_path(ctx: Ctx, root: Path | None = None,
+                    doc: object = _UNSET) -> Path:
+    """Return the native Claude MCP file for this scope.
+
+    Project-scoped MCP belongs in `<project>/.mcp.json`. User/local MCP is
+    stored in `~/.claude.json`; for override dirs, fall back to `mcp.json`
+    under the provided root so tests and explicit paths stay self-contained.
+    """
+    root = root or ctx.dst_root
+    doc = ctx.dst_doc if doc is _UNSET else doc
+    project_root = claude_project_root(ctx, root, doc)
+    if project_root:
+        return project_root / ".mcp.json"
+    if root.name == ".claude":
+        return root.parent / ".claude.json"
+    return root / "mcp.json"
+
+
 def make_frontmatter(d: dict) -> str:
     lines = ["---"]
     for k, v in d.items():
@@ -615,6 +681,10 @@ def tier_a_docs_claude_to_codex(ctx: Ctx) -> None:
     content_parts: list[str] = []
     if src.exists():
         content_parts.append(src.read_text(encoding="utf-8").rstrip() + "\n")
+    rules_doc = claude_rules_to_doc(ctx)
+    if rules_doc:
+        content_parts.append(rules_doc + "\n")
+        ctx.report.migrated_clean.append(".claude/rules/*.md → fenced blocks in AGENTS.md")
 
     # outputStyle: if set, append the style file's content fenced.
     settings = load_claude_settings(ctx.src_root)
@@ -651,7 +721,12 @@ def tier_a_docs_codex_to_claude(ctx: Ctx) -> None:
 
     content_parts: list[str] = []
     if src.exists():
-        content_parts.append(src.read_text(encoding="utf-8").rstrip() + "\n")
+        project_root = claude_project_root(ctx)
+        if project_root and src == project_root / "AGENTS.md":
+            content_parts.append("@AGENTS.md\n")
+            ctx.report.migrated_clean.append("AGENTS.md → CLAUDE.md import")
+        else:
+            content_parts.append(src.read_text(encoding="utf-8").rstrip() + "\n")
 
     cfg = load_toml(ctx.src_root / "config.toml")
     if "instructions" in cfg and isinstance(cfg["instructions"], str):
@@ -668,7 +743,7 @@ def tier_a_docs_codex_to_claude(ctx: Ctx) -> None:
         existing = dst.read_text(encoding="utf-8").rstrip()
         body = existing + "\n\n" + body if existing else body
     write_text(ctx, dst, body)
-    if src.exists():
+    if src.exists() and not any("AGENTS.md → CLAUDE.md import" in x for x in ctx.report.migrated_clean):
         ctx.report.migrated_clean.append(f"{src.name} → {dst.name}")
 
 
@@ -704,6 +779,44 @@ def tier_a_prompts_to_commands(ctx: Ctx) -> None:
         ctx.report.migrated_clean.append(f"prompts/{rel} → commands/{rel}")
 
 
+def tier_a_codex_agents_to_claude(ctx: Ctx) -> None:
+    src_dir = ctx.src_root / "agents"
+    if not src_dir.is_dir():
+        return
+    dst_dir = ctx.dst_root / "agents"
+    for f in sorted(src_dir.glob("*.toml")):
+        cfg = load_toml(f)
+        name = safe_agent_name(cfg.get("name") or f.stem)
+        description = str(cfg.get("description") or f"Imported from Codex agent {name}.")
+        body = str(cfg.get("developer_instructions") or cfg.get("instructions") or "").strip()
+        if not body:
+            ctx.report.skipped_unmappable.append(
+                f"agents/{f.name} (missing developer_instructions)")
+            continue
+
+        fm: dict[str, str] = {"name": name, "description": description}
+        if cfg.get("model"):
+            fm["model"] = str(cfg["model"])
+        effort = _codex_effort_to_claude(cfg.get("model_reasoning_effort"))
+        if effort:
+            fm["effort"] = effort
+        sandbox = cfg.get("sandbox_mode")
+        notes: list[str] = []
+        if sandbox:
+            notes.append(
+                f"Codex sandbox_mode={sandbox!r} has no exact Claude subagent field; "
+                "review permissions before relying on this agent."
+            )
+        if cfg.get("mcp_servers"):
+            notes.append(
+                "Codex agent-local mcp_servers were not copied; configure Claude MCP separately if needed."
+            )
+        if notes:
+            body += "\n\n## Manual migration notes\n\n" + "\n".join(f"- {n}" for n in notes)
+        write_text(ctx, dst_dir / f"{name}.md", make_frontmatter(fm) + body.rstrip() + "\n")
+        ctx.report.migrated_clean.append(f"agents/{f.name} → agents/{name}.md")
+
+
 def _normalize_mcp_claude_to_codex(name: str, spec: dict, report: Report) -> dict | None:
     """Codex only speaks stdio MCP; Claude's SSE/HTTP servers can't be
     represented and get reported as skipped."""
@@ -734,6 +847,94 @@ def _normalize_mcp_codex_to_claude(spec: dict) -> dict:
     return out
 
 
+def claude_read_mcp(ctx: Ctx, root: Path | None = None,
+                    doc: Path | None = None) -> dict:
+    root = root or ctx.src_root
+    doc = ctx.src_doc if doc is None else doc
+    native = claude_mcp_path(ctx, root, doc)
+    candidates = [native, root / "mcp.json"]
+    settings = load_claude_settings(root)
+    out: dict = {}
+    if isinstance(settings.get("mcpServers"), dict):
+        out.update(settings["mcpServers"])
+    for p in candidates:
+        if p.exists():
+            data = load_json(p)
+            if isinstance(data.get("mcpServers"), dict):
+                out.update(data["mcpServers"])
+    return out
+
+
+def claude_write_mcp(ctx: Ctx, servers: dict) -> None:
+    dst = claude_mcp_path(ctx)
+    existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
+    existing.setdefault("mcpServers", {})
+    existing["mcpServers"].update(servers)
+    write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+
+
+def claude_rules_to_doc(ctx: Ctx) -> str:
+    rules_dir = ctx.src_root / "rules"
+    if not rules_dir.is_dir():
+        return ""
+    parts: list[str] = []
+    for f in sorted(rules_dir.rglob("*.md")):
+        rel = f.relative_to(rules_dir)
+        body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+        fm = fm or {}
+        source = safe_cursor_rule_name(rel.as_posix().replace("/", "-").rsplit(".", 1)[0])
+        parts.append(fenced_block("claude-rule", source, body.strip()))
+        if fm:
+            ctx.report.notes.append(
+                f"rules/{rel}: native Claude rule frontmatter preserved only in rule file")
+    return "\n\n".join(parts)
+
+
+def cursor_rules_to_claude_rules(rules: list[CursorRule], claude_root: Path,
+                                 ctx: Ctx) -> None:
+    rules_dir = claude_root / "rules"
+    for r in rules:
+        fm: dict = {}
+        if r.description:
+            fm["description"] = r.description
+        if r.globs is not None:
+            fm["paths"] = r.globs if isinstance(r.globs, str) else ",".join(r.globs)
+        meta = {"alwaysApply": str(r.always_apply).lower()}
+        body = (f"<!-- migrator:cursor-meta json={json.dumps(meta, ensure_ascii=False)} -->\n"
+                f"{r.body.rstrip()}\n")
+        write_text(ctx, rules_dir / f"{safe_cursor_rule_name(r.name)}.md", make_frontmatter(fm) + body)
+
+
+def claude_read_rules_as_cursor(ctx: Ctx) -> list[CursorRule]:
+    rules_dir = ctx.src_root / "rules"
+    rules: list[CursorRule] = []
+    if not rules_dir.is_dir():
+        return rules
+    for f in sorted(rules_dir.rglob("*.md")):
+        rel = f.relative_to(rules_dir)
+        body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
+        fm = fm or {}
+        always = False
+        m = re.match(r"<!--\s*migrator:cursor-meta\s+(?P<meta>.*?)\s*-->\s*\n?",
+                     body, re.DOTALL)
+        if m:
+            attrs = _parse_comment_meta(m.group("meta"))
+            always = attrs.get("alwaysApply", "false").lower() == "true"
+            body = body[m.end():]
+        paths = fm.get("paths") or fm.get("globs")
+        globs: object = paths
+        if isinstance(paths, str) and "," in paths:
+            globs = [g.strip() for g in paths.split(",")]
+        rules.append(CursorRule(
+            name=safe_cursor_rule_name(rel.as_posix().replace("/", "-").rsplit(".", 1)[0]),
+            description=fm.get("description", ""),
+            globs=globs,
+            always_apply=always,
+            body=body.strip(),
+        ))
+    return rules
+
+
 def tier_a_settings_claude_to_codex(ctx: Ctx) -> None:
     settings = load_claude_settings(ctx.src_root)
     if not settings:
@@ -745,7 +946,7 @@ def tier_a_settings_claude_to_codex(ctx: Ctx) -> None:
         existing["model"] = settings["model"]
         ctx.report.migrated_clean.append("settings.json:model → config.toml:model")
 
-    mcp = settings.get("mcpServers") or {}
+    mcp = claude_read_mcp(ctx)
     if mcp:
         existing.setdefault("mcp_servers", {})
         for name, spec in mcp.items():
@@ -793,11 +994,13 @@ def tier_a_settings_codex_to_claude(ctx: Ctx) -> None:
 
     mcp = cfg.get("mcp_servers") or {}
     if mcp:
-        existing.setdefault("mcpServers", {})
-        for name, spec in mcp.items():
-            existing["mcpServers"][name] = _normalize_mcp_codex_to_claude(spec)
+        claude_write_mcp(ctx, {
+            name: _normalize_mcp_codex_to_claude(spec)
+            for name, spec in mcp.items()
+        })
+        for name in mcp:
             ctx.report.migrated_clean.append(
-                f"[mcp_servers.{name}] → mcpServers.{name}")
+                f"[mcp_servers.{name}] → {claude_mcp_path(ctx).name}:mcpServers.{name}")
 
     sep = cfg.get("shell_environment_policy") or {}
     set_vars = sep.get("set") or {}
@@ -1054,10 +1257,15 @@ def run_claude_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
             cursor_write_rules(rules, ctx.dst_root, ctx)
             ctx.report.migrated_clean.append(
                 f"{src_doc.name} → {len(rules)} cursor rule file(s)")
+    native_rules = claude_read_rules_as_cursor(ctx)
+    if native_rules:
+        cursor_write_rules(native_rules, ctx.dst_root, ctx)
+        ctx.report.migrated_clean.append(
+            f".claude/rules ({len(native_rules)} file(s)) → cursor rule file(s)")
 
-    # Tier A: MCP servers (Claude's mcpServers → Cursor's mcp.json).
+    # Tier A: MCP servers (Claude native MCP → Cursor's mcp.json).
     settings = load_claude_settings(ctx.src_root)
-    mcp = settings.get("mcpServers") or {}
+    mcp = claude_read_mcp(ctx)
     if mcp:
         out = {n: _normalize_mcp_for_cursor(s) for n, s in mcp.items()}
         cursor_write_mcp(out, ctx.dst_root, ctx)
@@ -1083,30 +1291,22 @@ def run_claude_to_cursor(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
 # ---- cursor → claude -------------------------------------------------------
 
 def run_cursor_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
-    # Tier A: rules → CLAUDE.md (fenced so the round-trip survives).
+    # Tier A: rules → native .claude/rules/*.md.
     rules = cursor_read_rules(ctx.src_root)
     if rules:
-        doc = cursor_rules_to_doc(rules)
-        dst_doc = ctx.dst_doc or (ctx.dst_root / "CLAUDE.md")
-        if dst_doc.exists() and ctx.merge:
-            doc = dst_doc.read_text(encoding="utf-8").rstrip() + "\n\n" + doc
-        write_text(ctx, dst_doc, doc + "\n")
+        cursor_rules_to_claude_rules(rules, ctx.dst_root, ctx)
         ctx.report.migrated_clean.append(
-            f"{len(rules)} cursor rule(s) → {dst_doc.name}")
+            f"{len(rules)} cursor rule(s) → .claude/rules/*.md")
 
     # Tier A: MCP.
     mcp = cursor_read_mcp(ctx.src_root)
     if mcp:
-        dst = ctx.dst_root / "settings.json"
-        existing = load_json(dst) if (ctx.merge and dst.exists()) else {}
-        existing.setdefault("mcpServers", {}).update(
-            {n: _normalize_mcp_for_cursor(s) for n, s in mcp.items()})
-        # Claude expects a `type` key; default to stdio if missing.
-        for n, s in existing["mcpServers"].items():
+        out = {n: _normalize_mcp_for_cursor(s) for n, s in mcp.items()}
+        for s in out.values():
             s.setdefault("type", "stdio")
-        write_text(ctx, dst, json.dumps(existing, indent=2) + "\n")
+        claude_write_mcp(ctx, out)
         ctx.report.migrated_clean.append(
-            _cursor_label_mcp("→ settings.json:mcpServers", mcp))
+            _cursor_label_mcp(f"→ {claude_mcp_path(ctx).name}:mcpServers", mcp))
 
     _run_lossy(ctx, lossy_decisions, "cursor->claude")
 
@@ -1421,33 +1621,104 @@ def _apply_codex_notify(ctx: Ctx) -> None:
         "config.toml:notify → hooks.Notification (single command, no matcher)")
 
 
-# ---- B3: agents → prompts (one-way) ---------------------------------------
+# ---- B3: Claude subagents → Codex custom-agent TOML ------------------------
 
 def _detect_claude_agents(ctx: Ctx) -> bool:
     p = ctx.src_root / "agents"
-    return p.is_dir() and any(p.rglob("*.md"))
+    return p.is_dir() and any(p.glob("*.md"))
 
 
 def _preview_claude_agents(ctx: Ctx) -> str:
-    n = sum(1 for _ in (ctx.src_root / "agents").rglob("*.md"))
-    return f"{n} subagent file(s) → prompts/agent-*.md (flattened; loses subagent semantics)"
+    n = sum(1 for _ in (ctx.src_root / "agents").glob("*.md"))
+    return f"{n} subagent file(s) → .codex/agents/*.toml (Codex custom agents)"
+
+
+def _render_codex_agent_body(body: str, fm: dict, unsupported: list[str]) -> str:
+    sections: list[str] = []
+    skills = _csv_values(fm.get("skills"))
+    tools = _csv_values(fm.get("tools"))
+    disallowed = _csv_values(fm.get("disallowedTools"))
+    permission_mode = fm.get("permissionMode")
+
+    if skills:
+        sections.append(
+            "## Skills\n\nYou're allowed to use these skills when working on this task:\n\n" +
+            "\n".join(f"- ${s}" for s in skills)
+        )
+    if tools or disallowed:
+        lines = [
+            "## Tools",
+            "",
+            "Claude tool allow/deny lists were preserved as prompt guidance, not Codex permissions.",
+        ]
+        if tools:
+            lines += ["", "You're allowed to use these tools:", "", *[f"- {t}" for t in tools]]
+        if disallowed:
+            lines += ["", "Don't use these tools:", "", *[f"- {t}" for t in disallowed]]
+        sections.append("\n".join(lines))
+
+    notes: list[str] = []
+    if permission_mode and not _claude_permission_to_codex_sandbox(permission_mode):
+        notes.append(
+            f"Claude permissionMode={permission_mode!r} has no direct Codex mapping; "
+            "choose sandbox_mode or permissions manually if needed."
+        )
+    if skills:
+        notes.append("Claude skills preload semantics were preserved as prompt guidance.")
+    if tools or disallowed:
+        notes.append("Rebuild Claude tool allow/deny intent with Codex sandbox, MCP filters, or app tool filters if hard enforcement is required.")
+    if unsupported:
+        notes.append("Review unsupported Claude subagent fields manually: " + ", ".join(f"`{x}`" for x in unsupported) + ".")
+    if notes:
+        sections.append("## MANUAL MIGRATION REQUIRED\n\n" + "\n".join(f"- {n}" for n in notes))
+    if not sections:
+        return body.strip()
+    return body.rstrip() + "\n\n" + "\n\n".join(sections)
 
 
 def _apply_claude_agents(ctx: Ctx) -> None:
     src_dir = ctx.src_root / "agents"
-    dst_dir = ctx.dst_root / "prompts"
-    for f in sorted(src_dir.rglob("*.md")):
+    dst_dir = ctx.dst_root / "agents"
+    supported = {
+        "name", "description", "model", "permissionMode", "skills",
+        "tools", "disallowedTools", "effort",
+    }
+    for f in sorted(src_dir.glob("*.md")):
+        if f.stem == "README":
+            continue
         rel = f.relative_to(src_dir)
-        out_name = "agent-" + rel.as_posix().replace("/", "-")
         body, fm = strip_frontmatter(f.read_text(encoding="utf-8"))
-        header = f"<!-- Converted from Claude subagent: agents/{rel} -->\n"
-        if fm:
-            header += (f"<!-- Original frontmatter: "
-                       f"{json.dumps(fm, ensure_ascii=False)} -->\n")
-        header += "\n"
-        write_text(ctx, dst_dir / out_name, header + body)
+        fm = fm or {}
+        name = safe_agent_name(fm.get("name") or f.stem)
+        description = fm.get("description") or (
+            f"Migrated Claude subagent inferred from `{_first_heading(body)}`."
+            if _first_heading(body) else f"Migrated Claude subagent inferred from `{f.name}`."
+        )
+        unsupported = sorted(k for k in fm if k not in supported)
+        agent: dict[str, object] = {
+            "name": name,
+            "description": description,
+            "developer_instructions": _render_codex_agent_body(body, fm, unsupported),
+        }
+        if fm.get("model"):
+            agent["model"] = fm["model"]
+        if fm.get("effort"):
+            mapped = EFFORT_C2X.get(fm["effort"], fm["effort"])
+            agent["model_reasoning_effort"] = "xhigh" if mapped == "high" and fm["effort"] == "max" else mapped
+        sandbox = _claude_permission_to_codex_sandbox(fm.get("permissionMode"))
+        if sandbox:
+            agent["sandbox_mode"] = sandbox
+
+        out_name = f"{name}.toml"
+        write_text(ctx, dst_dir / out_name, render_toml(agent))
+        caveats = []
+        if unsupported:
+            caveats.append("unsupported fields")
+        if fm.get("skills") or fm.get("tools") or fm.get("disallowedTools"):
+            caveats.append("prompt-guidance fields")
+        suffix = f" (review: {', '.join(caveats)})" if caveats else ""
         ctx.report.migrated_lossy.append(
-            f"agents/{rel} → prompts/{out_name} (lossy: no subagent runtime)")
+            f"agents/{rel} → agents/{out_name} (Codex custom agent){suffix}")
 
 
 # ---- B4: skills → prompts (one-way) ---------------------------------------
@@ -1704,9 +1975,9 @@ TIER_B: list[LossyOption] = [
     LossyOption(
         id="agents",
         direction="claude->codex",
-        label="agents/ → prompts/agent-*.md",
-        rationale=("Codex has no subagent system. Each agent.md is flattened "
-                   "into a plain prompt; the subagent runtime is lost."),
+        label="agents/ → .codex/agents/*.toml",
+        rationale=("Claude subagents map to Codex custom-agent TOML. Some "
+                   "Claude-only fields become prompt guidance or review notes."),
         detect=_detect_claude_agents,
         preview=_preview_claude_agents,
         apply=_apply_claude_agents,
@@ -1890,6 +2161,7 @@ def run_claude_to_codex(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
 def run_codex_to_claude(ctx: Ctx, lossy_decisions: dict[str, bool]) -> None:
     tier_a_docs_codex_to_claude(ctx)
     tier_a_prompts_to_commands(ctx)
+    tier_a_codex_agents_to_claude(ctx)
     tier_a_settings_codex_to_claude(ctx)
     _run_lossy(ctx, lossy_decisions, "codex->claude")
 
@@ -2057,9 +2329,6 @@ def main() -> int:
                     help="Source tool to migrate from.")
     ap.add_argument("--to", dest="to_tool", choices=TOOLS,
                     help="Destination tool to migrate to.")
-    ap.add_argument("--direction",
-                    help="Backward-compat shorthand for --from/--to, e.g. "
-                    "'claude-to-codex' or 'cursor-to-claude'.")
     ap.add_argument("--restore", nargs="?", const="__latest__",
                     metavar="BACKUP_DIR",
                     help="Restore from a previous migration backup. Pass a "
@@ -2083,22 +2352,10 @@ def main() -> int:
                     help="Comma-separated Tier B IDs to skip (or 'all').")
     args = ap.parse_args()
 
-    # Resolve from/to from either --from/--to or legacy --direction.
-    if args.direction and (args.from_tool or args.to_tool):
-        ap.error("use --from/--to or --direction, not both")
-    if args.direction:
-        if "-to-" not in args.direction:
-            ap.error(f"invalid --direction: {args.direction!r}; "
-                     "expected e.g. 'claude-to-codex'")
-        f, _, t = args.direction.partition("-to-")
-        if f not in TOOLS or t not in TOOLS:
-            ap.error(f"unknown tool(s) in --direction: {args.direction!r}")
-        args.from_tool, args.to_tool = f, t
-
     have_migrate = args.from_tool and args.to_tool
     have_restore = args.restore is not None
     if not have_migrate and not have_restore:
-        ap.error("either --from + --to, --direction, or --restore is required")
+        ap.error("either --from + --to or --restore is required")
     if have_migrate and have_restore:
         ap.error("--from/--to and --restore are mutually exclusive")
     if have_migrate and args.from_tool == args.to_tool:

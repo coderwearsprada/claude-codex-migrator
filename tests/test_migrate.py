@@ -14,10 +14,12 @@ Works on Python 3.9+ (uses migrate.py's TOML reader fallback when stdlib
 from __future__ import annotations
 
 import json
+import io
 import shutil
 import sys
 import tempfile
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 # Make migrate.py importable when run from anywhere.
@@ -228,11 +230,49 @@ class TierASettingsCodexToClaudeTests(FsTestBase):
         m.tier_a_settings_codex_to_claude(ctx)
 
         s = json.loads((self.dst / "settings.json").read_text())
+        mcp = json.loads((self.dst / "mcp.json").read_text())
         self.assertEqual(s["model"], "gpt-5")
-        self.assertEqual(s["mcpServers"]["foo"]["command"], "fooserver")
-        self.assertEqual(s["mcpServers"]["foo"]["type"], "stdio")
+        self.assertEqual(mcp["mcpServers"]["foo"]["command"], "fooserver")
+        self.assertEqual(mcp["mcpServers"]["foo"]["type"], "stdio")
         self.assertEqual(s["env"]["API_KEY"], "secret")
         self.assertEqual(s["effortLevel"], "low")
+
+    def test_project_scope_mcp_writes_project_root_mcp_json(self):
+        project = self.tmp / "project"
+        codex = project / ".codex"
+        claude = project / ".claude"
+        codex.mkdir(parents=True)
+        claude.mkdir()
+        (codex / "config.toml").write_text(
+            '[mcp_servers.foo]\ncommand = "fooserver"\n')
+
+        ctx = make_ctx(
+            codex, claude,
+            src_doc=project / "AGENTS.md",
+            dst_doc=project / "CLAUDE.md",
+        )
+        m.tier_a_settings_codex_to_claude(ctx)
+
+        self.assertFalse((claude / "settings.json").exists())
+        data = json.loads((project / ".mcp.json").read_text())
+        self.assertEqual(data["mcpServers"]["foo"]["command"], "fooserver")
+
+    def test_project_agents_md_import_is_used(self):
+        project = self.tmp / "project"
+        codex = project / ".codex"
+        claude = project / ".claude"
+        codex.mkdir(parents=True)
+        claude.mkdir()
+        (project / "AGENTS.md").write_text("# Existing Codex guide\n")
+
+        ctx = make_ctx(
+            codex, claude,
+            src_doc=project / "AGENTS.md",
+            dst_doc=project / "CLAUDE.md",
+        )
+        m.tier_a_docs_codex_to_claude(ctx)
+
+        self.assertEqual((project / "CLAUDE.md").read_text(), "@AGENTS.md\n")
 
 
 class CommandsRoundTripTests(FsTestBase):
@@ -370,17 +410,47 @@ class TierBHooksNotifyTests(FsTestBase):
 
 
 class TierBAgentsAndSkillsTests(FsTestBase):
-    def test_subagent_becomes_prefixed_prompt(self):
+    def test_subagent_becomes_codex_custom_agent(self):
         agents = self.src / "agents"
         agents.mkdir()
         (agents / "reviewer.md").write_text(
-            "---\nname: reviewer\n---\nDo a review.\n")
+            "---\nname: reviewer\ndescription: Review code\n"
+            "permissionMode: readOnly\nskills: release-notes\n"
+            "tools: Read\ndisallowedTools: Bash\neffort: max\n---\nDo a review.\n")
         ctx = make_ctx(self.src, self.dst)
         m._apply_claude_agents(ctx)
 
-        out = (self.dst / "prompts" / "agent-reviewer.md").read_text()
-        self.assertIn("Do a review.", out)
-        self.assertIn("Claude subagent", out)
+        agent = tomllib.loads((self.dst / "agents" / "reviewer.toml").read_text())
+        self.assertEqual(agent["name"], "reviewer")
+        self.assertEqual(agent["description"], "Review code")
+        self.assertEqual(agent["sandbox_mode"], "read-only")
+        self.assertEqual(agent["model_reasoning_effort"], "xhigh")
+        self.assertIn("Do a review.", agent["developer_instructions"])
+        self.assertIn("$release-notes", agent["developer_instructions"])
+        self.assertIn("Don't use these tools", agent["developer_instructions"])
+
+    def test_codex_custom_agent_becomes_claude_subagent(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "reviewer.toml").write_text(
+            'name = "reviewer"\n'
+            'description = "Review code"\n'
+            'model = "gpt-5"\n'
+            'model_reasoning_effort = "xhigh"\n'
+            'sandbox_mode = "read-only"\n'
+            'developer_instructions = "Do a review."\n'
+        )
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_codex_agents_to_claude(ctx)
+
+        out = (self.dst / "agents" / "reviewer.md").read_text()
+        body, fm = m.strip_frontmatter(out)
+        self.assertEqual(fm["name"], "reviewer")
+        self.assertEqual(fm["description"], "Review code")
+        self.assertEqual(fm["model"], "gpt-5")
+        self.assertEqual(fm["effort"], "max")
+        self.assertIn("Do a review.", body)
+        self.assertIn("sandbox_mode", body)
 
     def test_skill_flattens_and_notes_assets(self):
         sk = self.src / "skills" / "myskill"
@@ -571,6 +641,15 @@ class CursorToolPathsTests(unittest.TestCase):
         self.assertEqual(p["root"], Path("/tmp/somewhere"))
 
 
+class CliTests(unittest.TestCase):
+    def test_legacy_direction_flag_is_removed(self):
+        with mock.patch.object(sys, "argv", ["migrate.py", "--direction", "claude-to-codex"]), \
+             mock.patch.object(sys, "stderr", io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                m.main()
+        self.assertEqual(cm.exception.code, 2)
+
+
 class CursorDirectionDriversTests(FsTestBase):
     def test_claude_to_cursor_creates_rules_and_mcp(self):
         (self.src / "settings.json").write_text(json.dumps({
@@ -598,11 +677,11 @@ class CursorDirectionDriversTests(FsTestBase):
         ctx = make_ctx(self.src, self.dst)
         m.run_cursor_to_claude(ctx, {})
 
-        text = (self.dst / "CLAUDE.md").read_text()
-        self.assertIn("migrator:begin kind=cursor-rule source=r1", text)
-        self.assertIn('"globs": "src/**"', text)
-        s = json.loads((self.dst / "settings.json").read_text())
-        self.assertEqual(s["mcpServers"]["foo"]["type"], "stdio")
+        rule_text = (self.dst / "rules" / "r1.md").read_text()
+        self.assertIn("paths: src/**", rule_text)
+        self.assertIn("Rule one.", rule_text)
+        mcp = json.loads((self.dst / "mcp.json").read_text())
+        self.assertEqual(mcp["mcpServers"]["foo"]["type"], "stdio")
 
     def test_cursor_to_codex_filters_non_stdio_mcp(self):
         (self.src / "mcp.json").write_text(json.dumps({

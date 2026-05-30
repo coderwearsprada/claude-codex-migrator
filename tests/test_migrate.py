@@ -135,15 +135,22 @@ class FencedBlockTests(unittest.TestCase):
 
 
 class EffortMappingTests(unittest.TestCase):
-    def test_claude_to_codex_caps_at_high(self):
-        # Claude `max` has no Codex equivalent; it collapses to `high`.
-        self.assertEqual(m.EFFORT_C2X["max"], "high")
+    def test_xhigh_round_trips_one_to_one(self):
+        # Both tools natively support `xhigh` (Claude Code 2.1+; Codex).
+        self.assertEqual(m.EFFORT_C2X["xhigh"], "xhigh")
+        self.assertEqual(m.EFFORT_X2C["xhigh"], "xhigh")
         self.assertEqual(m.EFFORT_C2X["low"], "low")
+
+    def test_claude_legacy_max_maps_to_xhigh(self):
+        # `max` is the pre-2.1 Claude name for today's `xhigh`.
+        self.assertEqual(m.EFFORT_C2X["max"], "xhigh")
+        self.assertEqual(m._codex_effort_to_claude("xhigh"), "xhigh")
 
     def test_codex_minimal_maps_to_low(self):
         # Codex `minimal` has no Claude equivalent; it collapses to `low`.
         self.assertEqual(m.EFFORT_X2C["minimal"], "low")
         self.assertEqual(m.EFFORT_X2C["high"], "high")
+        self.assertEqual(m._codex_effort_to_claude("minimal"), "low")
 
 
 class McpNormalizeTests(unittest.TestCase):
@@ -193,7 +200,7 @@ class TierASettingsClaudeToCodexTests(FsTestBase):
             "model": "claude-opus",
             "mcpServers": {"foo": {"command": "fooserver", "args": ["--x"]}},
             "env": {"API_KEY": "secret"},
-            "effortLevel": "max",
+            "effortLevel": "max",  # legacy alias for xhigh
         }))
         ctx = make_ctx(self.src, self.dst)
         m.tier_a_settings_claude_to_codex(ctx)
@@ -202,7 +209,15 @@ class TierASettingsClaudeToCodexTests(FsTestBase):
         self.assertEqual(cfg["model"], "claude-opus")
         self.assertEqual(cfg["mcp_servers"]["foo"]["command"], "fooserver")
         self.assertEqual(cfg["shell_environment_policy"]["set"]["API_KEY"], "secret")
-        self.assertEqual(cfg["model_reasoning_effort"], "high")
+        self.assertEqual(cfg["model_reasoning_effort"], "xhigh")
+
+    def test_xhigh_effort_passes_through(self):
+        # Claude Code 2.1+ and Codex share `xhigh`, so it maps 1:1.
+        (self.src / "settings.json").write_text(json.dumps({"effortLevel": "xhigh"}))
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_claude_to_codex(ctx)
+        cfg = tomllib.loads((self.dst / "config.toml").read_text())
+        self.assertEqual(cfg["model_reasoning_effort"], "xhigh")
 
     def test_unmappable_keys_are_reported(self):
         (self.src / "settings.json").write_text(json.dumps({
@@ -236,6 +251,15 @@ class TierASettingsCodexToClaudeTests(FsTestBase):
         self.assertEqual(mcp["mcpServers"]["foo"]["type"], "stdio")
         self.assertEqual(s["env"]["API_KEY"], "secret")
         self.assertEqual(s["effortLevel"], "low")
+
+    def test_xhigh_effort_passes_through(self):
+        # `xhigh` is a native Claude effortLevel (2.1+), so it survives the trip.
+        (self.src / "config.toml").write_text(
+            'model = "gpt-5"\nmodel_reasoning_effort = "xhigh"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m.tier_a_settings_codex_to_claude(ctx)
+        s = json.loads((self.dst / "settings.json").read_text())
+        self.assertEqual(s["effortLevel"], "xhigh")
 
     def test_project_scope_mcp_writes_project_root_mcp_json(self):
         project = self.tmp / "project"
@@ -409,6 +433,20 @@ class TierBHooksNotifyTests(FsTestBase):
         self.assertIn("Notification", s["hooks"])
 
 
+class TierBProfilesTests(FsTestBase):
+    def test_profile_materializes_settings_with_xhigh_effort(self):
+        (self.src / "config.toml").write_text(
+            'model = "gpt-5"\n'
+            '[profiles.deep]\n'
+            'model_reasoning_effort = "xhigh"\n')
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_codex_profiles(ctx)
+
+        s = json.loads((self.dst / "profiles" / "deep.settings.json").read_text())
+        self.assertEqual(s["model"], "gpt-5")  # inherited from base config
+        self.assertEqual(s["effortLevel"], "xhigh")
+
+
 class TierBAgentsAndSkillsTests(FsTestBase):
     def test_subagent_becomes_codex_custom_agent(self):
         agents = self.src / "agents"
@@ -424,10 +462,20 @@ class TierBAgentsAndSkillsTests(FsTestBase):
         self.assertEqual(agent["name"], "reviewer")
         self.assertEqual(agent["description"], "Review code")
         self.assertEqual(agent["sandbox_mode"], "read-only")
-        self.assertEqual(agent["model_reasoning_effort"], "high")
+        self.assertEqual(agent["model_reasoning_effort"], "xhigh")
         self.assertIn("Do a review.", agent["developer_instructions"])
         self.assertIn("$release-notes", agent["developer_instructions"])
         self.assertIn("Don't use these tools", agent["developer_instructions"])
+
+    def test_subagent_xhigh_effort_maps_one_to_one(self):
+        agents = self.src / "agents"
+        agents.mkdir()
+        (agents / "deep.md").write_text(
+            "---\nname: deep\ndescription: Deep work\neffort: xhigh\n---\nThink hard.\n")
+        ctx = make_ctx(self.src, self.dst)
+        m._apply_claude_agents(ctx)
+        agent = tomllib.loads((self.dst / "agents" / "deep.toml").read_text())
+        self.assertEqual(agent["model_reasoning_effort"], "xhigh")
 
     def test_codex_custom_agent_becomes_claude_subagent(self):
         agents = self.src / "agents"
@@ -448,7 +496,7 @@ class TierBAgentsAndSkillsTests(FsTestBase):
         self.assertEqual(fm["name"], "reviewer")
         self.assertEqual(fm["description"], "Review code")
         self.assertEqual(fm["model"], "gpt-5")
-        self.assertEqual(fm["effort"], "max")
+        self.assertEqual(fm["effort"], "xhigh")
         self.assertIn("Do a review.", body)
         self.assertIn("sandbox_mode", body)
 

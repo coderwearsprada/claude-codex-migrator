@@ -245,8 +245,18 @@ CODEX_UNMAPPABLE_KEYS = (
     "disable_response_storage", "history", "project_doc_max_bytes",
 )
 
-EFFORT_C2X = {"low": "low", "medium": "medium", "high": "high", "max": "high"}
-EFFORT_X2C = {"minimal": "low", "low": "low", "medium": "medium", "high": "high"}
+# Claude `effortLevel` and Codex `model_reasoning_effort` share the
+# low/medium/high/xhigh vocabulary (Claude Code 2.1+; Codex), so those map 1:1.
+# Codex also has `minimal` (→ Claude `low`); Claude's pre-2.1 `max` is the old
+# name for today's `xhigh`, so it maps there too.
+EFFORT_C2X = {
+    "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh",
+    "max": "xhigh",  # legacy Claude alias = today's xhigh
+}
+EFFORT_X2C = {
+    "minimal": "low", "low": "low", "medium": "medium", "high": "high",
+    "xhigh": "xhigh",
+}
 
 
 # ============================================================================
@@ -425,7 +435,8 @@ def _claude_permission_to_codex_sandbox(mode: str | None) -> str | None:
 def _codex_effort_to_claude(effort: str | None) -> str | None:
     if not effort:
         return None
-    return {"minimal": "low", "xhigh": "max"}.get(effort, effort)
+    # Claude has no `minimal`; everything else (incl. `xhigh`) is a shared value.
+    return {"minimal": "low"}.get(effort, effort)
 
 
 _UNSET = object()

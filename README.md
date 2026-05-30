@@ -105,9 +105,10 @@ Notes:
   MCP servers transfer between Claude Code and Cursor (both support them),
   but are skipped going to Codex (stdio-only) with a report note.
 - Effort levels (Claude `effortLevel` ↔ Codex `model_reasoning_effort`)
-  map as `max ↔ high`, `minimal → low`, others 1:1. Cursor has no
-  equivalent reasoning-effort knob, so this field is reported but not
-  carried.
+  share the `low`/`medium`/`high`/`xhigh` vocabulary and map 1:1. Codex's
+  extra `minimal` maps to Claude `low`; the legacy Claude `max` alias (the
+  pre-2.1 name for `xhigh`) maps to Codex `xhigh`. Cursor has no equivalent
+  reasoning-effort knob, so this field is reported but not carried.
 
 ### Tier B — lossy, user-confirmed
 
@@ -202,7 +203,7 @@ python3 migrate.py --restore --dry-run          # preview only
 python3 -m unittest discover -s tests
 ```
 
-65 tests, stdlib-only. They cover the TOML writer, frontmatter and
+70 tests, stdlib-only. They cover the TOML writer, frontmatter and
 fenced-block round-trips, MCP normalization for all three tools, every
 Tier A direction (claude↔codex, claude↔cursor, codex↔cursor), the
 slash-command `description`/`argument-hint` round-trip, MDC frontmatter

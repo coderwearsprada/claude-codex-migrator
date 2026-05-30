@@ -424,7 +424,7 @@ class TierBAgentsAndSkillsTests(FsTestBase):
         self.assertEqual(agent["name"], "reviewer")
         self.assertEqual(agent["description"], "Review code")
         self.assertEqual(agent["sandbox_mode"], "read-only")
-        self.assertEqual(agent["model_reasoning_effort"], "xhigh")
+        self.assertEqual(agent["model_reasoning_effort"], "high")
         self.assertIn("Do a review.", agent["developer_instructions"])
         self.assertIn("$release-notes", agent["developer_instructions"])
         self.assertIn("Don't use these tools", agent["developer_instructions"])

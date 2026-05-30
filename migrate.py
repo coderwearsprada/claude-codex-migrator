@@ -1704,7 +1704,7 @@ def _apply_claude_agents(ctx: Ctx) -> None:
             agent["model"] = fm["model"]
         if fm.get("effort"):
             mapped = EFFORT_C2X.get(fm["effort"], fm["effort"])
-            agent["model_reasoning_effort"] = "xhigh" if mapped == "high" and fm["effort"] == "max" else mapped
+            agent["model_reasoning_effort"] = mapped
         sandbox = _claude_permission_to_codex_sandbox(fm.get("permissionMode"))
         if sandbox:
             agent["sandbox_mode"] = sandbox

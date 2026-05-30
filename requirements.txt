@@ -1,0 +1,6 @@
+# migrator has no third-party runtime dependencies.
+# It targets Python 3.9+ and uses only the standard library.
+# On Python 3.9/3.10 the stdlib `tomllib` (3.11+) is replaced by a
+# built-in minimal TOML parser, so `tomli` is not required either.
+#
+# Add pinned dependencies below if that ever changes.
